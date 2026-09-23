@@ -124,6 +124,18 @@ def recompute_daily_derived(engine, since: str | None = None) -> int:
         return conn.execute(text(sql), params).rowcount
 
 
+def _as_python(v):
+    """Unwrap numpy scalars into plain Python values.
+
+    psycopg2 adapts int/float/str, but not numpy's np.float64 / np.int64. Those
+    silently render into the SQL as their repr ("np.float64(0.42)"), which
+    Postgres parses as schema.function and rejects with InvalidSchemaName. The
+    callers should hand over clean values, but one missed float() cost a whole
+    nightly run, so normalise here too.
+    """
+    return v.item() if hasattr(v, "item") else v
+
+
 def bulk_upsert(engine, table: str, columns: list[str], rows: list[dict],
                 conflict_cols: list[str], update_cols: list[str],
                 page_size: int = 1000) -> int:
@@ -144,7 +156,7 @@ def bulk_upsert(engine, table: str, columns: list[str], rows: list[dict],
         f"INSERT INTO {table} ({col_list}) VALUES %s "
         f"ON CONFLICT ({', '.join(conflict_cols)}) DO UPDATE SET {updates}"
     )
-    values = [tuple(r.get(c) for c in columns) for r in rows]
+    values = [tuple(_as_python(r.get(c)) for c in columns) for r in rows]
 
     raw = engine.raw_connection()
     try:

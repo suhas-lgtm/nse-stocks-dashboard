@@ -115,7 +115,12 @@ def extract_rows(data: pd.DataFrame, batch_rows: list[dict], single: bool) -> tu
         last = sub.iloc[-1]
         prev_close = sub.iloc[-2]["Close"] if len(sub) >= 2 else None
         close = last["Close"]
-        chg_pct = round((close - prev_close) / prev_close * 100, 2) if prev_close else ""
+        # float() matters: close/prev_close are numpy scalars, and numpy
+        # types have no psycopg2 adapter — they end up in the SQL as the
+        # literal text "np.float64(0.42)", which Postgres reads as a schema
+        # reference and rejects.
+        chg_pct = (round(float(close - prev_close) / float(prev_close) * 100, 2)
+                   if prev_close else "")
 
         rows.append({
             "date": sub.index[-1].date().isoformat(),
