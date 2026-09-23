@@ -23,23 +23,53 @@ are therefore not included. Tracked series:
 | BE | Trade-to-trade equity (must take delivery, no intraday) |
 | BZ | Trade-to-trade, Z-group (surveillance) |
 
+## Where the data lives
+
+Prices, indices, share counts and watchlists live in **Postgres** (a free Neon
+database), not in this repo. The connection string is supplied as
+`DATABASE_URL` — a GitHub Actions secret for the fetch jobs, and a Streamlit
+secret for the app. It is never committed.
+
+This replaced an earlier setup that committed CSVs to git on every fetch. That
+worked, but every commit triggered a Streamlit redeploy, which restarted the
+app and wiped in-memory state (watchlists) twice a day, and the repo grew
+~70MB/year. With the database, fresh data appears without any redeploy.
+
+| Table | Holds |
+|---|---|
+| `daily_prices` | one row per (date, symbol) — OHLC, change %, volume |
+| `indices_history` | one row per (date, index) — level and day change % |
+| `shares_outstanding` | share count per symbol, for market cap |
+| `watchlist` | the Personal watchlist, persisted across devices/restarts |
+| `meta` | `last_fetched_utc`, shown in the app header |
+
+The CSVs under `data/` are the pre-migration snapshot. They're no longer read
+or written — `scripts/migrate_csv_to_db.py` loaded them into Postgres once.
+`data/symbol_master.csv` is the exception: it stays a file (small, changes
+monthly) because the price fetch reads it to know which symbols to pull.
+
 ## Layout
 
 ```
-scripts/refresh_symbol_master.py     # builds data/symbol_master.csv from NSE (run monthly/manually)
-scripts/fetch_yahoo_prices.py        # nightly: reads symbol_master.csv, pulls prices from Yahoo
-scripts/fetch_indices.py             # nightly: pulls all 26 tracked Indian indices
-scripts/backfill_history.py          # one-time: pulls ~1y of history for every stock (for the date picker)
-scripts/fetch_shares_outstanding.py  # monthly: shares outstanding per stock, for market cap
-data/symbol_master.csv               # symbol, series, isin, name — the tracked universe
-data/daily/YYYY-MM-DD.csv            # one archived price snapshot per trading day
-data/latest.csv                      # copy of the most recent day, used by the dashboard
-data/indices_history.csv             # date, index, close, chg_pct — long format, all 26 indices
-data/shares_outstanding.csv          # symbol, shares_outstanding — multiply by close for market cap
-dashboard.py                         # Streamlit dashboard: Stocks / Returns calculator / All Indices tabs
-.github/workflows/nightly_fetch.yml           # nightly Yahoo price + index refresh (cloud)
-.github/workflows/monthly_symbol_refresh.yml  # monthly symbol list + shares outstanding refresh (cloud)
+scripts/db.py                        # engine, schema, and the batched upsert helper
+scripts/migrate_csv_to_db.py         # one-time: loaded the existing CSVs into Postgres
+scripts/refresh_symbol_master.py     # monthly: rebuilds data/symbol_master.csv from NSE
+scripts/fetch_yahoo_prices.py        # 4pm + 11pm: pulls prices from Yahoo -> daily_prices
+scripts/fetch_indices.py             # 4pm + 11pm: pulls 26 Indian indices -> indices_history
+scripts/fetch_shares_outstanding.py  # monthly: share counts -> shares_outstanding
+scripts/backfill_history.py          # one-time: ~1y of history for every stock
+dashboard.py                         # Streamlit app: Stocks / Returns / All Indices / Watchlist
+.github/workflows/nightly_fetch.yml           # 4pm + 11pm IST price + index refresh
+.github/workflows/monthly_symbol_refresh.yml  # monthly symbol list + share counts
 ```
+
+### A note on bulk writes
+
+`db.bulk_upsert` exists because the obvious approach is a trap: SQLAlchemy's
+`executemany` sends one round trip per row. Against a US-hosted database that's
+~250ms each, so a 2,900-row nightly write took **14 minutes**. Batching the rows
+with `psycopg2.extras.execute_values` brought the same write down to **16
+seconds**. Use that helper for any multi-row write.
 
 ### Historical dates, returns calculator & indices
 

@@ -95,15 +95,16 @@ def main():
             elapsed = time.time() - start
             print(f"  {i}/{len(symbols)} done ({elapsed:.0f}s elapsed, {len(missing)} missing so far)")
 
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with OUT_PATH.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["symbol", "shares_outstanding"])
-        writer.writeheader()
-        writer.writerows(rows)
+    from db import bulk_upsert, get_engine
+
+    bulk_upsert(
+        get_engine(), "shares_outstanding", ["symbol", "shares_outstanding"], rows,
+        conflict_cols=["symbol"], update_cols=["shares_outstanding"],
+    )
 
     elapsed = time.time() - start
     print(f"\nDone in {elapsed:.0f}s: {len(rows)}/{len(symbols)} symbols with shares data.")
-    print(f"Wrote {OUT_PATH}")
+    print(f"Wrote {len(rows)} rows to the database")
     if missing:
         print(f"{len(missing)} symbols had no shares data (delisted/illiquid?): {missing[:20]}"
               f"{' ...' if len(missing) > 20 else ''}")

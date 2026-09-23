@@ -163,12 +163,37 @@ def fetch_batch_with_retries(batch: list[dict]) -> tuple[list[dict], list[str]]:
     return rows, missing
 
 
-def write_csv(rows: list[dict], path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=OUT_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
+def write_rows_to_db(rows: list[dict]) -> None:
+    """Upsert into daily_prices, plus stamp meta.last_fetched_utc."""
+    from datetime import datetime, timezone
+
+    from db import bulk_upsert, get_engine
+    from sqlalchemy import text
+
+    engine = get_engine()
+    # Deduplicate on (date, symbol): a stock whose latest bar lagged can appear
+    # under two dates in one run, and Postgres refuses an upsert that touches
+    # the same row twice.
+    deduped = {(r["date"], r["symbol"]): r for r in rows}
+    payload = [
+        {k: (None if v == "" else v) for k, v in r.items()}
+        for r in deduped.values()
+    ]
+
+    cols = ["date", "symbol", "series", "name", "open", "high", "low", "close",
+            "prev_close", "chg_pct", "volume", "value"]
+    bulk_upsert(
+        engine, "daily_prices", cols, payload,
+        conflict_cols=["date", "symbol"],
+        update_cols=[c for c in cols if c not in ("date", "symbol")],
+    )
+
+    with engine.begin() as conn:
+        conn.execute(
+            text("""INSERT INTO meta (key, value) VALUES ('last_fetched_utc', :v)
+                    ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"""),
+            {"v": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")},
+        )
 
 
 def main():
@@ -217,21 +242,13 @@ def main():
     target_date_str = max(set(dates), key=dates.count)
 
     all_rows.sort(key=lambda r: (r["series"], r["symbol"]))
-    daily_path = DAILY_DIR / f"{target_date_str}.csv"
-    write_csv(all_rows, daily_path)
-    write_csv(all_rows, LATEST_PATH)
+    write_rows_to_db(all_rows)
 
     by_series = {}
     for r in all_rows:
         by_series[r["series"]] = by_series.get(r["series"], 0) + 1
 
-    META_PATH.write_text(json.dumps({
-        "last_fetched_utc": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    }))
-
-    print(f"Wrote {len(all_rows)} rows to {daily_path}")
-    print(f"Updated {LATEST_PATH}")
-    print(f"Updated {META_PATH}")
+    print(f"Wrote {len(all_rows)} rows to the database (latest date {target_date_str})")
     print("Breakdown by series:", by_series)
     if all_missing:
         print(f"{len(all_missing)} symbols missing (likely genuinely delisted/suspended): {all_missing}")

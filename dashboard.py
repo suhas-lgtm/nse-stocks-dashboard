@@ -4,26 +4,19 @@ Layout/design will be revisited later; this just needs to show the data clearly.
 """
 
 import hashlib
-import json
+import os
 from datetime import datetime
-from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
+from sqlalchemy import create_engine, text
 
 IST = ZoneInfo("Asia/Kolkata")
 
 # Same password/hash as the claude.ai preview's Personal Watchlist, for consistency.
-# Client-side-equivalent deterrent, not real security — see note in the Watchlist tab.
+# A deterrent against casual edits from anyone with the link, not real security.
 WATCHLIST_PASSWORD_HASH = "7a759a779365ae885791dfa59c42d0a86ed7f7d078c793db022cceab9514c136"
-
-ROOT = Path(__file__).resolve().parent
-DAILY_DIR = ROOT / "data" / "daily"
-LATEST_PATH = ROOT / "data" / "latest.csv"
-INDICES_PATH = ROOT / "data" / "indices_history.csv"
-SHARES_PATH = ROOT / "data" / "shares_outstanding.csv"
-META_PATH = ROOT / "data" / "meta.json"
 
 st.set_page_config(page_title="NSE Stocks Dashboard", layout="wide", page_icon="📈")
 
@@ -101,38 +94,97 @@ CAP_BANDS = [
 CAP_CATEGORIES = [b[0] for b in CAP_BANDS]
 
 
+@st.cache_resource
+def get_db():
+    """One engine per app process. Reads the URL from Streamlit secrets in the
+    cloud, or DATABASE_URL locally."""
+    url = None
+    try:
+        url = st.secrets["DATABASE_URL"]
+    except Exception:
+        url = os.environ.get("DATABASE_URL")
+    if not url:
+        st.error(
+            "No database configured. Add DATABASE_URL to this app's Streamlit "
+            "secrets (Manage app → Settings → Secrets)."
+        )
+        st.stop()
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    return create_engine(url, pool_pre_ping=True)
+
+
 @st.cache_data(ttl=600)
 def available_dates() -> list[str]:
-    return sorted(p.stem for p in DAILY_DIR.glob("*.csv"))
+    with get_db().connect() as conn:
+        rows = conn.execute(
+            text("SELECT DISTINCT date::text FROM daily_prices ORDER BY 1")
+        ).fetchall()
+    return [r[0] for r in rows]
 
 
 @st.cache_data(ttl=600)
 def load_day(date_str: str) -> pd.DataFrame:
-    path = DAILY_DIR / f"{date_str}.csv"
-    df = pd.read_csv(path)
-    numeric_cols = ["open", "high", "low", "close", "prev_close", "chg_pct", "volume", "value"]
-    for col in numeric_cols:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
+    return pd.read_sql(
+        text("""SELECT date::text AS date, symbol, series, name, open, high, low,
+                       close, prev_close, chg_pct, volume, value
+                FROM daily_prices WHERE date = :d"""),
+        get_db(), params={"d": date_str},
+    )
 
 
 @st.cache_data(ttl=600)
 def load_indices() -> pd.DataFrame:
-    if not INDICES_PATH.exists():
-        return pd.DataFrame(columns=["date", "index", "close", "chg_pct"])
-    df = pd.read_csv(INDICES_PATH)
-    df["close"] = pd.to_numeric(df["close"], errors="coerce")
-    df["chg_pct"] = pd.to_numeric(df["chg_pct"], errors="coerce")
+    df = pd.read_sql(
+        text("""SELECT date::text AS date, index_name AS index, close, chg_pct
+                FROM indices_history ORDER BY index_name, date"""),
+        get_db(),
+    )
     return df
 
 
 @st.cache_data(ttl=600)
 def load_shares() -> pd.DataFrame:
-    if not SHARES_PATH.exists():
-        return pd.DataFrame(columns=["symbol", "shares_outstanding"])
-    df = pd.read_csv(SHARES_PATH)
-    df["shares_outstanding"] = pd.to_numeric(df["shares_outstanding"], errors="coerce")
-    return df
+    return pd.read_sql(
+        text("SELECT symbol, shares_outstanding FROM shares_outstanding"), get_db()
+    )
+
+
+@st.cache_data(ttl=600)
+def load_last_fetched() -> str | None:
+    with get_db().connect() as conn:
+        row = conn.execute(
+            text("SELECT value FROM meta WHERE key = 'last_fetched_utc'")
+        ).fetchone()
+    return row[0] if row else None
+
+
+# --- Watchlist storage (the reason we moved to a database: these now survive
+# --- app restarts, redeploys, and are the same on every device.
+def watchlist_symbols(list_type: str) -> list[str]:
+    with get_db().connect() as conn:
+        rows = conn.execute(
+            text("SELECT symbol FROM watchlist WHERE list_type = :t ORDER BY added_at"),
+            {"t": list_type},
+        ).fetchall()
+    return [r[0] for r in rows]
+
+
+def watchlist_add(list_type: str, symbol: str) -> None:
+    with get_db().begin() as conn:
+        conn.execute(
+            text("""INSERT INTO watchlist (list_type, symbol) VALUES (:t, :s)
+                    ON CONFLICT (list_type, symbol) DO NOTHING"""),
+            {"t": list_type, "s": symbol},
+        )
+
+
+def watchlist_remove(list_type: str, symbol: str) -> None:
+    with get_db().begin() as conn:
+        conn.execute(
+            text("DELETE FROM watchlist WHERE list_type = :t AND symbol = :s"),
+            {"t": list_type, "s": symbol},
+        )
 
 
 def cap_category(mc_cr) -> str:
@@ -176,13 +228,14 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-if META_PATH.exists():
+_last_fetched = load_last_fetched()
+if _last_fetched:
     try:
-        fetched_utc = datetime.strptime(
-            json.loads(META_PATH.read_text())["last_fetched_utc"], "%Y-%m-%dT%H:%M:%SZ"
-        ).replace(tzinfo=ZoneInfo("UTC"))
+        fetched_utc = datetime.strptime(_last_fetched, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=ZoneInfo("UTC")
+        )
         st.caption(f"Last fetched {fetched_utc.astimezone(IST).strftime('%d %b %Y, %I:%M %p')} IST")
-    except (KeyError, ValueError, json.JSONDecodeError):
+    except ValueError:
         pass
 
 dates = available_dates()
@@ -458,8 +511,15 @@ with tab_watchlist:
         rows = rows.sort_values("_order").drop(columns="_order")
         return rows[["symbol", "name", "series", "cap_category", "market_cap_cr", "close", "chg_pct"]]
 
-    def _render_watchlist(state_key: str, key_prefix: str, removable: bool = True):
-        symbols = st.session_state.setdefault(state_key, [])
+    # Personal list lives in the database (survives restarts, same on every
+    # device). Common list stays per-visitor and temporary, as specified.
+    def _get_symbols(state_key: str, persistent: bool) -> list[str]:
+        if persistent:
+            return watchlist_symbols(state_key)
+        return st.session_state.setdefault(state_key, [])
+
+    def _render_watchlist(state_key: str, key_prefix: str, persistent: bool):
+        symbols = _get_symbols(state_key, persistent)
         if not symbols:
             st.caption("Empty — add a stock below.")
             return
@@ -468,27 +528,32 @@ with tab_watchlist:
             table.rename(columns={"cap_category": "cap", "market_cap_cr": "mkt cap (₹cr)"}),
             use_container_width=True, hide_index=True,
         )
-        if removable:
-            remove_sym = st.selectbox(
-                "Remove a stock", ["—"] + symbols, key=f"{key_prefix}_remove_select"
-            )
-            if remove_sym != "—" and st.button("Remove", key=f"{key_prefix}_remove_btn"):
+        remove_sym = st.selectbox(
+            "Remove a stock", ["—"] + symbols, key=f"{key_prefix}_remove_select"
+        )
+        if remove_sym != "—" and st.button("Remove", key=f"{key_prefix}_remove_btn"):
+            if persistent:
+                watchlist_remove(state_key, remove_sym)
+            else:
                 st.session_state[state_key] = [s for s in symbols if s != remove_sym]
-                st.rerun()
+            st.rerun()
 
-    def _add_stock_ui(state_key: str, key_prefix: str):
+    def _add_stock_ui(state_key: str, key_prefix: str, persistent: bool):
         choice = st.selectbox(
             "Add a stock", ["—"] + symbol_options, key=f"{key_prefix}_add_select"
         )
         if choice != "—" and st.button("Add", key=f"{key_prefix}_add_btn"):
             symbol = choice.split(" — ")[0]
-            symbols = st.session_state.setdefault(state_key, [])
-            if symbol not in symbols:
-                symbols.append(symbol)
+            if persistent:
+                watchlist_add(state_key, symbol)
+            else:
+                symbols = st.session_state.setdefault(state_key, [])
+                if symbol not in symbols:
+                    symbols.append(symbol)
             st.rerun()
 
-    def _watchlist_returns_calculator(state_key: str, key_prefix: str):
-        symbols = st.session_state.get(state_key, [])
+    def _watchlist_returns_calculator(state_key: str, key_prefix: str, persistent: bool):
+        symbols = _get_symbols(state_key, persistent)
         st.markdown("**Returns calculator**")
         if not symbols:
             st.caption("Add stocks above to calculate returns.")
@@ -535,10 +600,8 @@ with tab_watchlist:
 
     st.subheader("Personal Watchlist")
     st.caption(
-        "Password-protected. Note: this resets when the page reloads or the app "
-        "restarts — it isn't saved permanently yet (that needs a bit more setup: "
-        "a GitHub token in the app's secrets so it can commit your list to the repo). "
-        "Ask if you want that wired up."
+        "Password-protected and saved permanently in the database — it's the same "
+        "list on every device and survives app restarts."
     )
 
     unlocked = st.session_state.setdefault("personal_watchlist_unlocked", False)
@@ -554,18 +617,18 @@ with tab_watchlist:
         if st.button("Lock", key="personal_watchlist_lock_btn"):
             st.session_state["personal_watchlist_unlocked"] = False
             st.rerun()
-        _render_watchlist("personal_watchlist", "pw")
-        _add_stock_ui("personal_watchlist", "pw")
+        _render_watchlist("personal", "pw", persistent=True)
+        _add_stock_ui("personal", "pw", persistent=True)
         st.divider()
-        _watchlist_returns_calculator("personal_watchlist", "pw")
+        _watchlist_returns_calculator("personal", "pw", persistent=True)
 
     st.divider()
     st.subheader("Common Watchlist")
     st.caption(
-        "Open to everyone viewing this dashboard right now — add a portfolio to "
-        "check it. Nothing here is saved; it resets when the page reloads."
+        "Open to anyone — add a portfolio to check it right now. Nothing here is "
+        "saved; it resets when the page reloads."
     )
-    _render_watchlist("common_watchlist", "cw")
-    _add_stock_ui("common_watchlist", "cw")
+    _render_watchlist("common_watchlist", "cw", persistent=False)
+    _add_stock_ui("common_watchlist", "cw", persistent=False)
     st.divider()
-    _watchlist_returns_calculator("common_watchlist", "cw")
+    _watchlist_returns_calculator("common_watchlist", "cw", persistent=False)

@@ -24,20 +24,25 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # symbol_master.csv stays a file (small, changes rarely, and the price
+      # fetch reads it to know which symbols to pull), so this one still
+      # commits — but only once a month, not twice a day.
       - name: Refresh symbol master from NSE
         run: python scripts/refresh_symbol_master.py
 
       - name: Refresh shares outstanding from Yahoo Finance
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/fetch_shares_outstanding.py
 
-      - name: Commit and push if changed
+      - name: Commit symbol master if changed
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add data/symbol_master.csv data/shares_outstanding.csv
+          git add data/symbol_master.csv
           if git diff --cached --quiet; then
-            echo "No changes to symbol master or shares outstanding."
+            echo "No changes to symbol master."
           else
-            git commit -m "Monthly refresh: symbol master + shares outstanding $(date -u +'%Y-%m-%d')"
+            git commit -m "Monthly refresh: symbol master $(date -u +'%Y-%m-%d')"
             git push
           fi

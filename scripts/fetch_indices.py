@@ -113,32 +113,42 @@ def main():
         print("ERROR: fetched 0 index rows.")
         sys.exit(1)
 
-    new_df = pd.DataFrame(new_rows)
-    if OUT_PATH.exists():
-        existing = pd.read_csv(OUT_PATH, dtype={"date": str})
-        # Keep existing chg_pct only where we're not about to overwrite that
-        # (date, index) with a fresh row — the fresh row's chg_pct is blank
-        # and gets recomputed below from the merged, correctly-ordered series.
-        combined = pd.concat([existing, new_df], ignore_index=True)
-    else:
-        combined = new_df
+    from db import bulk_upsert, get_engine
+    from sqlalchemy import text
 
-    combined = combined.drop_duplicates(subset=["date", "index"], keep="last")
-    combined = combined.sort_values(["index", "date"]).reset_index(drop=True)
+    engine = get_engine()
 
-    # Recompute chg_pct for every row from the merged series itself, not from
-    # whatever a single day's fetch happened to see. This matters most for the
-    # ~14 indices Yahoo only ever gives us one day of at a time (see INDICES
-    # comment above) — without this, they'd never get a day change % even
-    # after we've accumulated several nights' worth of their history.
-    combined["chg_pct"] = (
-        combined.groupby("index")["close"].pct_change().mul(100).round(2)
+    # Deduplicate this fetch, then upsert only the levels. chg_pct is left for
+    # the SQL pass below, which computes it against the real previous stored day.
+    deduped = {(r["date"], r["index"]): r for r in new_rows}
+    records = [
+        {"date": k[0], "index_name": k[1], "close": float(v["close"])}
+        for k, v in deduped.items()
+    ]
+    bulk_upsert(
+        engine, "indices_history", ["date", "index_name", "close"], records,
+        conflict_cols=["date", "index_name"], update_cols=["close"],
     )
-    combined["chg_pct"] = combined["chg_pct"].apply(lambda v: "" if pd.isna(v) else v)
 
-    OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    combined.to_csv(OUT_PATH, index=False, columns=OUT_COLUMNS)
-    print(f"Wrote {len(combined)} total rows to {OUT_PATH}")
+    # Recompute chg_pct set-wise from the stored series, rather than from
+    # whatever a single fetch happened to return. This is what finally gives
+    # the ~14 indices Yahoo only ever returns one day of (see INDICES above)
+    # a day change %, once we've accumulated two nights of their history.
+    with engine.begin() as conn:
+        conn.execute(text("""
+            WITH ordered AS (
+                SELECT date, index_name, close,
+                       LAG(close) OVER (PARTITION BY index_name ORDER BY date) AS prev
+                FROM indices_history
+            )
+            UPDATE indices_history h
+            SET chg_pct = ROUND(((o.close - o.prev) / o.prev * 100)::numeric, 2)
+            FROM ordered o
+            WHERE h.date = o.date AND h.index_name = o.index_name
+              AND o.prev IS NOT NULL AND o.prev <> 0
+        """))
+
+    print(f"Upserted {len(records)} index rows; recomputed day-change % in SQL.")
 
 
 if __name__ == "__main__":
