@@ -2,7 +2,12 @@ name: Nightly NSE price fetch (Yahoo Finance)
 
 on:
   schedule:
-    # 23:00 IST = 17:30 UTC.
+    # 16:00 IST = 10:30 UTC — fast run, ~30 min after market close. Yahoo
+    # doesn't always have the final settled price ready this early, so...
+    - cron: "30 10 * * *"
+    # ...23:00 IST = 17:30 UTC — safety-net re-run. Safe to run twice a day:
+    # the script just overwrites with whatever's latest, so this catches and
+    # self-corrects anything the 4pm run got before Yahoo had finalized it.
     - cron: "30 17 * * *"
   workflow_dispatch: {}
 
