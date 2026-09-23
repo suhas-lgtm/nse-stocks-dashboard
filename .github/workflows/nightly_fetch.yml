@@ -16,6 +16,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      # Without this, Python buffers stdout and the log prints out of order
+      # (the traceback lands above the messages that led up to it).
+      PYTHONUNBUFFERED: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -25,6 +29,13 @@ jobs:
 
       - name: Install dependencies
         run: pip install -r requirements.txt
+
+      # Fail in seconds, not after a ten-minute download, if the database
+      # is unreachable or the DATABASE_URL secret is missing.
+      - name: Check database connection
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/check_db.py
 
       # Data now goes straight into Postgres — nothing is committed back to the
       # repo, so the dashboard picks up fresh data without a redeploy (which

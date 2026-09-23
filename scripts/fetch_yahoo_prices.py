@@ -204,9 +204,26 @@ def write_rows_to_db(rows: list[dict]) -> None:
         )
 
 
+def check_db_reachable() -> None:
+    """Fail before the ten-minute download, not after it.
+
+    The fetch loop takes ~10 minutes; discovering only at the end that the
+    database is unreachable wastes the whole run and throws away the data we
+    just downloaded.
+    """
+    from db import get_engine
+    from sqlalchemy import text
+
+    with get_engine().connect() as conn:
+        conn.execute(text("SELECT 1"))
+    print("Database reachable.")
+
+
 def main():
     master_rows = load_symbol_master()
     print(f"Loaded {len(master_rows)} symbols from {MASTER_PATH}")
+
+    check_db_reachable()
 
     print("Checking canary symbols before starting the full run...")
     if not check_canaries():
