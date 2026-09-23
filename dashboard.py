@@ -487,6 +487,52 @@ with tab_watchlist:
                 symbols.append(symbol)
             st.rerun()
 
+    def _watchlist_returns_calculator(state_key: str, key_prefix: str):
+        symbols = st.session_state.get(state_key, [])
+        st.markdown("**Returns calculator**")
+        if not symbols:
+            st.caption("Add stocks above to calculate returns.")
+            return
+        c1, c2 = st.columns(2)
+        w_from = c1.date_input("From", value=min_date, min_value=min_date, max_value=max_date, key=f"{key_prefix}_ret_from")
+        w_to = c2.date_input("To", value=max_date, min_value=min_date, max_value=max_date, key=f"{key_prefix}_ret_to")
+        if w_from > w_to:
+            st.error("'From' date must be on or before 'To' date.")
+            return
+
+        from_str = nearest_available(dates, w_from.strftime("%Y-%m-%d"))
+        to_str = nearest_available(dates, w_to.strftime("%Y-%m-%d"))
+        if from_str != w_from.strftime("%Y-%m-%d") or to_str != w_to.strftime("%Y-%m-%d"):
+            st.caption(f"Using nearest trading days: {from_str} → {to_str}")
+
+        df_start = load_day(from_str).set_index("symbol")
+        df_end = load_day(to_str).set_index("symbol")
+        present = [s for s in symbols if s in df_start.index and s in df_end.index]
+        if not present:
+            st.caption("None of these stocks have data on both dates.")
+            return
+
+        w_ret = pd.DataFrame({
+            "symbol": present,
+            "name": df_end.loc[present, "name"].values,
+            "close_start": df_start.loc[present, "close"].values,
+            "close_end": df_end.loc[present, "close"].values,
+        })
+        w_ret["return_pct"] = round(
+            (w_ret["close_end"] - w_ret["close_start"]) / w_ret["close_start"] * 100, 2
+        )
+        # Same data-glitch guard as the main Returns calculator tab.
+        w_ret = w_ret[w_ret["return_pct"].abs() <= 300]
+        w_ret = w_ret.sort_values("return_pct", ascending=False)
+
+        st.dataframe(
+            w_ret.rename(columns={
+                "close_start": f"close ({from_str})", "close_end": f"close ({to_str})",
+                "return_pct": "return %",
+            }),
+            use_container_width=True, hide_index=True,
+        )
+
     st.subheader("Personal Watchlist")
     st.caption(
         "Password-protected. Note: this resets when the page reloads or the app "
@@ -510,6 +556,8 @@ with tab_watchlist:
             st.rerun()
         _render_watchlist("personal_watchlist", "pw")
         _add_stock_ui("personal_watchlist", "pw")
+        st.divider()
+        _watchlist_returns_calculator("personal_watchlist", "pw")
 
     st.divider()
     st.subheader("Common Watchlist")
@@ -519,3 +567,5 @@ with tab_watchlist:
     )
     _render_watchlist("common_watchlist", "cw")
     _add_stock_ui("common_watchlist", "cw")
+    st.divider()
+    _watchlist_returns_calculator("common_watchlist", "cw")
