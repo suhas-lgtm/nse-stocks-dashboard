@@ -20,7 +20,68 @@ INDICES_PATH = ROOT / "data" / "indices_history.csv"
 SHARES_PATH = ROOT / "data" / "shares_outstanding.csv"
 META_PATH = ROOT / "data" / "meta.json"
 
-st.set_page_config(page_title="NSE Stocks Dashboard", layout="wide")
+st.set_page_config(page_title="NSE Stocks Dashboard", layout="wide", page_icon="📈")
+
+st.markdown("""
+<style>
+[data-testid="stAppViewContainer"] {
+    background:
+        radial-gradient(680px 320px at 12% -10%, rgba(74,144,255,0.10), transparent 60%),
+        radial-gradient(520px 260px at 88% -6%, rgba(124,92,255,0.08), transparent 60%),
+        #06070a;
+}
+[data-testid="stHeader"] { background: transparent; }
+
+[data-testid="stMetric"] {
+    background: linear-gradient(160deg, #181b22, #12141a);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    padding: 14px 16px 10px;
+    box-shadow: 0 6px 16px rgba(0,0,0,0.25);
+}
+[data-testid="stMetricValue"] {
+    font-variant-numeric: tabular-nums;
+    font-family: ui-monospace, "SFMono-Regular", "Cascadia Code", Consolas, monospace;
+}
+[data-testid="stMetricLabel"] { color: #9aa1ae; }
+
+.stTabs [data-baseweb="tab-list"] { gap: 4px; border-bottom: 1px solid #23262f; }
+.stTabs [data-baseweb="tab"] { color: #9aa1ae; font-weight: 600; }
+.stTabs [aria-selected="true"] { color: #f4f5f7 !important; }
+
+[data-testid="stDataFrame"] {
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    overflow: hidden;
+}
+
+.nse-header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
+.nse-brand-mark {
+    width: 40px; height: 40px; border-radius: 10px; flex: none;
+    background: linear-gradient(135deg, #4a90ff, #7c5cff);
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 4px 16px rgba(74,144,255,0.35);
+}
+.nse-title { font-size: 27px; font-weight: 700; margin: 0; color: #f4f5f7; line-height: 1.2; }
+.nse-subtitle { font-size: 13px; color: #9aa1ae; margin: 2px 0 0; }
+
+.nse-idx-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
+.nse-idx-tile {
+    flex: 1 1 160px; min-width: 150px;
+    background: linear-gradient(160deg, #181b22, #12141a);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    padding: 12px 14px;
+    box-shadow: 0 6px 16px rgba(0,0,0,0.25);
+}
+.nse-idx-name { font-size: 10.5px; font-weight: 700; letter-spacing: 0.03em; color: #9aa1ae; text-transform: uppercase; }
+.nse-idx-value { font-size: 18px; font-weight: 600; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; color: #f4f5f7; }
+.nse-idx-delta { font-size: 12px; font-weight: 600; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; margin-left: 6px; }
+.nse-up { color: #22c55e; }
+.nse-down { color: #f5504f; }
+.nse-flat { color: #676e7a; }
+</style>
+""", unsafe_allow_html=True)
 
 # Market cap bands (₹ crore) — as specified for this dashboard. Note this is a
 # simpler/looser cut than SEBI's official large/mid/small-cap classification
@@ -97,7 +158,18 @@ POPULAR_INDICES = [
     "NIFTY NEXT 50", "NIFTY MIDCAP 150", "NIFTY SMALLCAP 250", "NIFTY 100", "NIFTY 500",
 ]
 
-st.title("NSE Stocks Dashboard")
+st.markdown("""
+<div class="nse-header">
+  <div class="nse-brand-mark">
+    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#fff" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round"><path d="M4 19V10M10 19V5M16 19V13M22 19V8"/></svg>
+  </div>
+  <div>
+    <p class="nse-title">NSE Stocks Dashboard</p>
+    <p class="nse-subtitle">Daily close prices for NSE main-board stocks (EQ, BE, BZ series)</p>
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
 if META_PATH.exists():
     try:
@@ -126,11 +198,23 @@ if not indices_df.empty:
     latest_idx_date = indices_df["date"].max()
     today_idx = indices_df[indices_df["date"] == latest_idx_date].set_index("index")
     shown = [name for name in POPULAR_INDICES if name in today_idx.index]
-    idx_cols = st.columns(len(shown)) if shown else []
-    for col, name in zip(idx_cols, shown):
+
+    tiles_html = []
+    for name in shown:
         row = today_idx.loc[name]
-        delta = f"{row['chg_pct']:+.2f}%" if pd.notna(row["chg_pct"]) else None
-        col.metric(name.title(), f"{row['close']:,.2f}", delta)
+        chg = row["chg_pct"]
+        if pd.notna(chg):
+            direction = "nse-up" if chg > 0 else ("nse-down" if chg < 0 else "nse-flat")
+            arrow = "▲" if chg > 0 else ("▼" if chg < 0 else "")
+            sign = "+" if chg > 0 else ""
+            delta_html = f'<span class="nse-idx-delta {direction}">{arrow} {sign}{chg:.2f}%</span>'
+        else:
+            delta_html = ""
+        tiles_html.append(
+            f'<div class="nse-idx-tile"><div class="nse-idx-name">{name}</div>'
+            f'<div><span class="nse-idx-value">{row["close"]:,.2f}</span>{delta_html}</div></div>'
+        )
+    st.markdown(f'<div class="nse-idx-row">{"".join(tiles_html)}</div>', unsafe_allow_html=True)
     st.caption(f"Popular indices as of {latest_idx_date} · full list under the \"All Indices\" tab")
     st.divider()
 
