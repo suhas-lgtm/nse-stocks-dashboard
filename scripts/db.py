@@ -88,6 +88,42 @@ def create_schema(engine) -> None:
             conn.execute(text(stmt))
 
 
+def recompute_daily_derived(engine, since: str | None = None) -> int:
+    """Recompute prev_close and chg_pct for daily_prices from the stored series.
+
+    Do NOT trust the fetch window for this. yfinance returns a rolling window
+    that sometimes skips a trading day for a given symbol, so taking "the
+    second-to-last row I just fetched" silently compares against the wrong day
+    (this produced wrong change % for ~1,750 of 2,600 stocks). The database
+    knows the real previous trading day per symbol; LAG() uses it.
+
+    `since` limits which rows get rewritten (the window still scans all history
+    so the boundary row is correct). Pass None for a full rebuild.
+    """
+    sql = """
+        WITH ordered AS (
+            SELECT date, symbol,
+                   LAG(close) OVER (PARTITION BY symbol ORDER BY date) AS prev
+            FROM daily_prices
+        )
+        UPDATE daily_prices d
+        SET prev_close = o.prev,
+            chg_pct = CASE
+                WHEN o.prev IS NOT NULL AND o.prev <> 0
+                THEN ROUND((((d.close - o.prev) / o.prev) * 100)::numeric, 2)
+                ELSE NULL
+            END
+        FROM ordered o
+        WHERE d.date = o.date AND d.symbol = o.symbol
+    """
+    params = {}
+    if since:
+        sql += " AND d.date >= :since"
+        params["since"] = since
+    with engine.begin() as conn:
+        return conn.execute(text(sql), params).rowcount
+
+
 def bulk_upsert(engine, table: str, columns: list[str], rows: list[dict],
                 conflict_cols: list[str], update_cols: list[str],
                 page_size: int = 1000) -> int:

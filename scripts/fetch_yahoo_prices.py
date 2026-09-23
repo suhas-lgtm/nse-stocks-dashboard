@@ -167,7 +167,7 @@ def write_rows_to_db(rows: list[dict]) -> None:
     """Upsert into daily_prices, plus stamp meta.last_fetched_utc."""
     from datetime import datetime, timezone
 
-    from db import bulk_upsert, get_engine
+    from db import bulk_upsert, get_engine, recompute_daily_derived
     from sqlalchemy import text
 
     engine = get_engine()
@@ -187,6 +187,14 @@ def write_rows_to_db(rows: list[dict]) -> None:
         conflict_cols=["date", "symbol"],
         update_cols=[c for c in cols if c not in ("date", "symbol")],
     )
+
+    # Fix up prev_close / chg_pct against the real previous trading day. The
+    # values we just wrote came from yfinance's rolling window, which sometimes
+    # skips a day; this recomputes them from the stored series instead. Limited
+    # to recent dates so it stays cheap on a nightly run.
+    cutoff = min(r["date"] for r in payload) if payload else None
+    n = recompute_daily_derived(engine, since=cutoff)
+    print(f"Recomputed prev_close/chg_pct for {n} rows from {cutoff} onward.")
 
     with engine.begin() as conn:
         conn.execute(
