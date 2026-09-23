@@ -101,13 +101,11 @@ def main():
         closes = sub["Close"]
         for i in range(len(closes)):
             close = float(closes.iloc[i])
-            prev = float(closes.iloc[i - 1]) if i > 0 else None
-            chg_pct = round((close - prev) / prev * 100, 2) if prev else ""
             new_rows.append({
                 "date": closes.index[i].date().isoformat(),
                 "index": name,
                 "close": round(close, 2),
-                "chg_pct": chg_pct,
+                "chg_pct": "",  # recomputed below, after merging with what we already have
             })
         print(f"{name}: {len(closes)} day(s), latest {closes.index[-1].date()} = {closes.iloc[-1]:.2f}")
 
@@ -118,12 +116,25 @@ def main():
     new_df = pd.DataFrame(new_rows)
     if OUT_PATH.exists():
         existing = pd.read_csv(OUT_PATH, dtype={"date": str})
+        # Keep existing chg_pct only where we're not about to overwrite that
+        # (date, index) with a fresh row — the fresh row's chg_pct is blank
+        # and gets recomputed below from the merged, correctly-ordered series.
         combined = pd.concat([existing, new_df], ignore_index=True)
     else:
         combined = new_df
 
     combined = combined.drop_duplicates(subset=["date", "index"], keep="last")
-    combined = combined.sort_values(["index", "date"])
+    combined = combined.sort_values(["index", "date"]).reset_index(drop=True)
+
+    # Recompute chg_pct for every row from the merged series itself, not from
+    # whatever a single day's fetch happened to see. This matters most for the
+    # ~14 indices Yahoo only ever gives us one day of at a time (see INDICES
+    # comment above) — without this, they'd never get a day change % even
+    # after we've accumulated several nights' worth of their history.
+    combined["chg_pct"] = (
+        combined.groupby("index")["close"].pct_change().mul(100).round(2)
+    )
+    combined["chg_pct"] = combined["chg_pct"].apply(lambda v: "" if pd.isna(v) else v)
 
     OUT_PATH.parent.mkdir(parents=True, exist_ok=True)
     combined.to_csv(OUT_PATH, index=False, columns=OUT_COLUMNS)

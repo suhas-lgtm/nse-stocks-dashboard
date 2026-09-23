@@ -3,6 +3,7 @@ Base dashboard for NSE stocks — a first pass to verify the data pipeline works
 Layout/design will be revisited later; this just needs to show the data clearly.
 """
 
+import hashlib
 import json
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,10 @@ import pandas as pd
 import streamlit as st
 
 IST = ZoneInfo("Asia/Kolkata")
+
+# Same password/hash as the claude.ai preview's Personal Watchlist, for consistency.
+# Client-side-equivalent deterrent, not real security — see note in the Watchlist tab.
+WATCHLIST_PASSWORD_HASH = "7a759a779365ae885791dfa59c42d0a86ed7f7d078c793db022cceab9514c136"
 
 ROOT = Path(__file__).resolve().parent
 DAILY_DIR = ROOT / "data" / "daily"
@@ -218,7 +223,9 @@ if not indices_df.empty:
     st.caption(f"Popular indices as of {latest_idx_date} · full list under the \"All Indices\" tab")
     st.divider()
 
-tab_stocks, tab_returns, tab_indices = st.tabs(["Stocks", "Returns calculator", "All Indices"])
+tab_stocks, tab_returns, tab_indices, tab_watchlist = st.tabs(
+    ["Stocks", "Returns calculator", "All Indices", "Watchlist"]
+)
 
 # ============================================================ Tab 1: Stocks
 with tab_stocks:
@@ -258,15 +265,18 @@ with tab_stocks:
         filtered = filtered[mask]
 
     sort_col = st.selectbox(
-        "Sort by", ["chg_pct", "symbol", "close", "volume", "value", "market_cap_cr"], index=0, key="stocks_sort"
+        "Sort by", ["chg_pct", "symbol", "close", "market_cap_cr"], index=0, key="stocks_sort"
     )
     sort_desc = st.checkbox("Descending", value=True, key="stocks_sort_desc")
     filtered = filtered.sort_values(sort_col, ascending=not sort_desc)
 
     st.dataframe(
-        filtered[["symbol", "name", "series", "cap_category", "market_cap_cr", "open", "high", "low",
-                  "close", "prev_close", "chg_pct", "volume", "value"]]
-        .rename(columns={"cap_category": "cap", "market_cap_cr": "mkt cap (₹cr)"}),
+        filtered[["symbol", "name", "series", "cap_category", "market_cap_cr",
+                  "close", "prev_close", "chg_pct"]]
+        .rename(columns={
+            "cap_category": "cap", "market_cap_cr": "mkt cap (₹cr)",
+            "close": "current price", "prev_close": "previous close", "chg_pct": "chg %",
+        }),
         use_container_width=True, hide_index=True, height=600,
     )
     st.caption(
@@ -321,14 +331,31 @@ with tab_returns:
         ret_df["market_cap_cr"] = (ret_df["shares_outstanding"] * ret_df["close_end"] / 1e7).round(1)
         ret_df["cap_category"] = ret_df["market_cap_cr"].apply(cap_category)
 
+        # Yahoo's raw feed has occasional bad ticks for thinly-traded ETFs/funds
+        # (e.g. a gold or index fund showing a ~100x jump between two days that
+        # never happened) — checked "Adj Close" too, it has the same bad value,
+        # so this isn't a stock-split adjustment issue, it's a genuine data
+        # glitch. |return| > 300% is a generous cutoff (a real microcap can
+        # legitimately rally hard) that still catches the clearly-broken ones.
+        IMPLAUSIBLE_THRESHOLD = 300
+        ret_df["implausible"] = ret_df["return_pct"].abs() > IMPLAUSIBLE_THRESHOLD
+
         st.caption(f"{len(ret_df):,} stocks with data on both dates")
+        hide_implausible = st.checkbox(
+            f"Hide implausible returns (>{IMPLAUSIBLE_THRESHOLD}% — usually bad data "
+            "for thinly-traded ETFs/funds, not a real move)",
+            value=True, key="ret_hide_implausible",
+        )
+        ret_clean = ret_df[~ret_df["implausible"]] if hide_implausible else ret_df
+        if hide_implausible and ret_df["implausible"].any():
+            st.caption(f"{ret_df['implausible'].sum()} stock(s) hidden as implausible.")
 
         series_opt = sorted(ret_df["series"].dropna().unique().tolist())
         sel_series = st.multiselect("Series", series_opt, default=series_opt, key="ret_series")
         sel_caps = st.multiselect("Market cap", CAP_CATEGORIES, default=CAP_CATEGORIES, key="ret_cap")
         ret_search = st.text_input("Search symbol or name", "", key="ret_search")
 
-        ret_filtered = ret_df[ret_df["series"].isin(sel_series) & ret_df["cap_category"].isin(sel_caps)]
+        ret_filtered = ret_clean[ret_clean["series"].isin(sel_series) & ret_clean["cap_category"].isin(sel_caps)]
         if ret_search:
             mask = (
                 ret_filtered["symbol"].str.contains(ret_search, case=False, na=False)
@@ -348,8 +375,8 @@ with tab_returns:
         )
 
         st.divider()
-        top_g = ret_df.sort_values("return_pct", ascending=False).head(10)
-        top_l = ret_df.sort_values("return_pct", ascending=True).head(10)
+        top_g = ret_clean.sort_values("return_pct", ascending=False).head(10)
+        top_l = ret_clean.sort_values("return_pct", ascending=True).head(10)
         gcol, lcol = st.columns(2)
         with gcol:
             st.subheader(f"Best returns ({from_str} → {to_str})")
@@ -417,3 +444,78 @@ with tab_indices:
         chosen = st.selectbox("Index", idx_with_history, key="idx_choice")
         sub = indices_df[indices_df["index"] == chosen].sort_values("date")
         st.line_chart(sub.set_index("date")["close"])
+
+# ==================================================== Tab 4: Watchlist
+with tab_watchlist:
+    today_df = with_market_cap(load_day(dates[-1]), shares_df)
+    symbol_lookup = today_df.set_index("symbol")[["name", "series"]].to_dict("index")
+    symbol_options = sorted(f"{s} — {info['name']}" for s, info in symbol_lookup.items())
+
+    def _watchlist_table(symbols: list[str]) -> pd.DataFrame:
+        rows = today_df[today_df["symbol"].isin(symbols)].copy()
+        # Keep watchlist order rather than whatever order the merge produced.
+        rows["_order"] = rows["symbol"].apply(symbols.index)
+        rows = rows.sort_values("_order").drop(columns="_order")
+        return rows[["symbol", "name", "series", "cap_category", "market_cap_cr", "close", "chg_pct"]]
+
+    def _render_watchlist(state_key: str, key_prefix: str, removable: bool = True):
+        symbols = st.session_state.setdefault(state_key, [])
+        if not symbols:
+            st.caption("Empty — add a stock below.")
+            return
+        table = _watchlist_table(symbols)
+        st.dataframe(
+            table.rename(columns={"cap_category": "cap", "market_cap_cr": "mkt cap (₹cr)"}),
+            use_container_width=True, hide_index=True,
+        )
+        if removable:
+            remove_sym = st.selectbox(
+                "Remove a stock", ["—"] + symbols, key=f"{key_prefix}_remove_select"
+            )
+            if remove_sym != "—" and st.button("Remove", key=f"{key_prefix}_remove_btn"):
+                st.session_state[state_key] = [s for s in symbols if s != remove_sym]
+                st.rerun()
+
+    def _add_stock_ui(state_key: str, key_prefix: str):
+        choice = st.selectbox(
+            "Add a stock", ["—"] + symbol_options, key=f"{key_prefix}_add_select"
+        )
+        if choice != "—" and st.button("Add", key=f"{key_prefix}_add_btn"):
+            symbol = choice.split(" — ")[0]
+            symbols = st.session_state.setdefault(state_key, [])
+            if symbol not in symbols:
+                symbols.append(symbol)
+            st.rerun()
+
+    st.subheader("Personal Watchlist")
+    st.caption(
+        "Password-protected. Note: this resets when the page reloads or the app "
+        "restarts — it isn't saved permanently yet (that needs a bit more setup: "
+        "a GitHub token in the app's secrets so it can commit your list to the repo). "
+        "Ask if you want that wired up."
+    )
+
+    unlocked = st.session_state.setdefault("personal_watchlist_unlocked", False)
+    if not unlocked:
+        pw = st.text_input("Password", type="password", key="personal_watchlist_pw")
+        if st.button("Unlock", key="personal_watchlist_unlock_btn"):
+            if hashlib.sha256(pw.encode("utf-8")).hexdigest() == WATCHLIST_PASSWORD_HASH:
+                st.session_state["personal_watchlist_unlocked"] = True
+                st.rerun()
+            else:
+                st.error("Wrong password.")
+    else:
+        if st.button("Lock", key="personal_watchlist_lock_btn"):
+            st.session_state["personal_watchlist_unlocked"] = False
+            st.rerun()
+        _render_watchlist("personal_watchlist", "pw")
+        _add_stock_ui("personal_watchlist", "pw")
+
+    st.divider()
+    st.subheader("Common Watchlist")
+    st.caption(
+        "Open to everyone viewing this dashboard right now — add a portfolio to "
+        "check it. Nothing here is saved; it resets when the page reloads."
+    )
+    _render_watchlist("common_watchlist", "cw")
+    _add_stock_ui("common_watchlist", "cw")
