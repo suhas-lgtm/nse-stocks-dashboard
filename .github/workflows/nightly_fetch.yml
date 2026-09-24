@@ -49,3 +49,15 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/fetch_indices.py
+
+      # WhatsApp alert for big movers in the personal watchlist. continue-on-error
+      # keeps a messaging hiccup from marking the data collection as failed —
+      # the prices are already safely written by this point.
+      - name: WhatsApp alert for watchlist movers
+        continue-on-error: true
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          CALLMEBOT_PHONE: ${{ secrets.CALLMEBOT_PHONE }}
+          CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
+          ALERT_THRESHOLD_PCT: "3"
+        run: python scripts/send_watchlist_alert.py
