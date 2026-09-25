@@ -344,6 +344,17 @@ with tab_stocks:
     selected_caps = st.multiselect("Market cap", CAP_CATEGORIES, default=CAP_CATEGORIES, key="stocks_cap")
     sector_opts = sector_options(df)
     selected_sectors = st.multiselect("Sector", sector_opts, default=sector_opts, key="stocks_sector")
+    # Exact market-cap range, for when the four bands are too coarse (e.g.
+    # "between 8,000 and 40,000 cr"). Blank means no limit in that direction.
+    mc1, mc2 = st.columns(2)
+    mc_min = mc1.number_input(
+        "Min market cap (₹cr)", min_value=0.0, value=None, step=1000.0,
+        placeholder="no minimum", key="stocks_mc_min",
+    )
+    mc_max = mc2.number_input(
+        "Max market cap (₹cr)", min_value=0.0, value=None, step=1000.0,
+        placeholder="no maximum", key="stocks_mc_max",
+    )
     search = st.text_input("Search symbol or name", "", key="stocks_search")
 
     filtered = df[
@@ -351,6 +362,23 @@ with tab_stocks:
         & df["cap_category"].isin(selected_caps)
         & df["sector"].isin(selected_sectors)
     ]
+
+    if mc_min is not None and mc_max is not None and mc_min > mc_max:
+        st.warning("Min market cap is above max — no stocks can match.")
+    # NaN fails both comparisons, so setting either bound drops the stocks with
+    # no shares data. That's the right default: you asked for a cap range, and
+    # we don't know theirs.
+    if mc_min is not None:
+        filtered = filtered[filtered["market_cap_cr"] >= mc_min]
+    if mc_max is not None:
+        filtered = filtered[filtered["market_cap_cr"] <= mc_max]
+    if mc_min is not None or mc_max is not None:
+        lo = f"₹{mc_min:,.0f}cr" if mc_min is not None else "any"
+        hi = f"₹{mc_max:,.0f}cr" if mc_max is not None else "any"
+        st.caption(
+            f"Market cap between {lo} and {hi} — {len(filtered):,} stocks. "
+            "Stocks with unknown market cap are excluded while a bound is set."
+        )
     if search:
         mask = (
             filtered["symbol"].str.contains(search, case=False, na=False)
