@@ -109,8 +109,12 @@ def get_db():
             "secrets (Manage app → Settings → Secrets)."
         )
         st.stop()
+    # Same driver pin as scripts/db.py — SQLAlchemy 2.1 defaults a bare
+    # postgresql:// URL to psycopg v3, which isn't installed here.
     if url.startswith("postgres://"):
         url = url.replace("postgres://", "postgresql://", 1)
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
     return create_engine(url, pool_pre_ping=True)
 
 

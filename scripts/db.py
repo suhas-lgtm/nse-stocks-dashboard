@@ -75,6 +75,23 @@ SCHEMA_STATEMENTS = [
 ]
 
 
+def normalize_db_url(url: str) -> str:
+    """Pin the driver explicitly: postgresql+psycopg2://
+
+    SQLAlchemy 2.1 changed the default DBAPI for a bare "postgresql://" URL
+    from psycopg2 to psycopg (v3), which we do not install. Because
+    requirements.txt allows >=2.0, GitHub picked up 2.1.0 the day it shipped
+    and every run died with ModuleNotFoundError: No module named 'psycopg'
+    before it even tried to connect. Naming the driver makes the URL immune to
+    that default changing again.
+    """
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    if url.startswith("postgresql://"):
+        url = url.replace("postgresql://", "postgresql+psycopg2://", 1)
+    return url
+
+
 def get_engine(url: str | None = None):
     """SQLAlchemy engine. Pass a url explicitly, else read DATABASE_URL."""
     url = url or os.environ.get("DATABASE_URL")
@@ -83,12 +100,9 @@ def get_engine(url: str | None = None):
             "DATABASE_URL is not set. Set it as an environment variable "
             "(locally / in GitHub Actions secrets) or in Streamlit secrets."
         )
-    # Neon/Supabase hand out postgres:// URLs; SQLAlchemy wants postgresql://
-    if url.startswith("postgres://"):
-        url = url.replace("postgres://", "postgresql://", 1)
     # pool_pre_ping avoids stale-connection errors when the serverless DB
     # wakes back up from idle.
-    return create_engine(url, pool_pre_ping=True)
+    return create_engine(normalize_db_url(url), pool_pre_ping=True)
 
 
 def wait_for_db(engine, attempts: int = 5, backoff_seconds: int = 10) -> None:
