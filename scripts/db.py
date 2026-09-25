@@ -91,6 +91,32 @@ def get_engine(url: str | None = None):
     return create_engine(url, pool_pre_ping=True)
 
 
+def wait_for_db(engine, attempts: int = 5, backoff_seconds: int = 10) -> None:
+    """Connect, retrying through a serverless cold start.
+
+    Neon suspends its compute after a few minutes idle and takes a while to
+    wake. A single connect attempt can time out against a database that is
+    perfectly healthy, so retry before declaring failure.
+    """
+    import time
+
+    last = None
+    for attempt in range(1, attempts + 1):
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            if attempt > 1:
+                print(f"Connected on attempt {attempt}.")
+            return
+        except Exception as e:
+            last = e
+            print(f"  connect attempt {attempt}/{attempts} failed "
+                  f"({type(e).__name__}); database may be waking up...")
+            if attempt < attempts:
+                time.sleep(backoff_seconds)
+    raise RuntimeError(f"Could not connect after {attempts} attempts: {last}")
+
+
 def create_schema(engine) -> None:
     with engine.begin() as conn:
         for stmt in SCHEMA_STATEMENTS:

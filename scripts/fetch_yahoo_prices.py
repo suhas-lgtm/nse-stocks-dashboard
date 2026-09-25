@@ -216,11 +216,9 @@ def check_db_reachable() -> None:
     database is unreachable wastes the whole run and throws away the data we
     just downloaded.
     """
-    from db import get_engine
-    from sqlalchemy import text
+    from db import get_engine, wait_for_db
 
-    with get_engine().connect() as conn:
-        conn.execute(text("SELECT 1"))
+    wait_for_db(get_engine())
     print("Database reachable.")
 
 

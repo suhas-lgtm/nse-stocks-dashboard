@@ -13,7 +13,7 @@ import os
 import re
 import sys
 
-from db import create_schema, get_engine
+from db import create_schema, get_engine, wait_for_db
 
 
 def masked(url: str) -> str:
@@ -35,8 +35,7 @@ def main() -> int:
 
     engine = get_engine()
     try:
-        with engine.connect() as conn:
-            conn.execute(text("SELECT 1"))
+        wait_for_db(engine)
         print("Connection OK.")
     except Exception as e:
         print(f"FAIL: could not connect: {type(e).__name__}: {e}")
