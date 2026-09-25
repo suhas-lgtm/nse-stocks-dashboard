@@ -151,6 +151,18 @@ def load_shares() -> pd.DataFrame:
 
 
 @st.cache_data(ttl=600)
+def load_sectors() -> pd.DataFrame:
+    """Sector per symbol. Returns an empty frame if the table isn't there yet,
+    so a deploy that lands before the first sector fetch degrades to showing
+    everything as "Unknown" instead of taking the whole dashboard down."""
+    try:
+        return pd.read_sql(text("SELECT symbol, sector FROM symbol_sector"), get_db())
+    except Exception:
+        return pd.DataFrame({"symbol": pd.Series(dtype="object"),
+                             "sector": pd.Series(dtype="object")})
+
+
+@st.cache_data(ttl=600)
 def load_last_fetched() -> str | None:
     with get_db().connect() as conn:
         row = conn.execute(
@@ -196,12 +208,29 @@ def cap_category(mc_cr) -> str:
     return "Unknown"
 
 
+UNKNOWN_SECTOR = "Unknown"
+
+
+def with_sector(df: pd.DataFrame, sectors_df: pd.DataFrame) -> pd.DataFrame:
+    """Adds NSE's sector label. Symbols outside NSE's index lists get "Unknown"
+    — mostly small BE-series names, which NSE doesn't classify anywhere."""
+    merged = df.merge(sectors_df, on="symbol", how="left")
+    merged["sector"] = merged["sector"].fillna(UNKNOWN_SECTOR)
+    return merged
+
+
 def with_market_cap(df: pd.DataFrame, shares_df: pd.DataFrame) -> pd.DataFrame:
     """Adds market_cap_cr and cap_category, computed as shares_outstanding x close."""
     merged = df.merge(shares_df, on="symbol", how="left")
     merged["market_cap_cr"] = (merged["shares_outstanding"] * merged["close"] / 1e7).round(1)
     merged["cap_category"] = merged["market_cap_cr"].apply(cap_category)
     return merged
+
+
+def sector_options(df: pd.DataFrame) -> list[str]:
+    """Sector names for a filter, with "Unknown" pushed to the end."""
+    present = sorted(set(df["sector"].dropna()) - {UNKNOWN_SECTOR})
+    return present + ([UNKNOWN_SECTOR] if (df["sector"] == UNKNOWN_SECTOR).any() else [])
 
 
 def nearest_available(dates: list[str], target: str) -> str:
@@ -249,6 +278,7 @@ if not dates:
 min_date = datetime.strptime(dates[0], "%Y-%m-%d").date()
 max_date = datetime.strptime(dates[-1], "%Y-%m-%d").date()
 shares_df = load_shares()
+sectors_df = load_sectors()
 
 # ---- Popular index strip (always visible) ----
 indices_df = load_indices()
@@ -293,6 +323,7 @@ with tab_stocks:
 
     df = load_day(selected_date_str)
     df = with_market_cap(df, shares_df)
+    df = with_sector(df, sectors_df)
     as_of = df["date"].iloc[0] if not df.empty else selected_date_str
     st.caption(f"Data as of {as_of} · Source: Yahoo Finance · {len(df):,} securities")
 
@@ -307,9 +338,15 @@ with tab_stocks:
     series_options = sorted(df["series"].dropna().unique().tolist())
     selected_series = st.multiselect("Series", series_options, default=series_options, key="stocks_series")
     selected_caps = st.multiselect("Market cap", CAP_CATEGORIES, default=CAP_CATEGORIES, key="stocks_cap")
+    sector_opts = sector_options(df)
+    selected_sectors = st.multiselect("Sector", sector_opts, default=sector_opts, key="stocks_sector")
     search = st.text_input("Search symbol or name", "", key="stocks_search")
 
-    filtered = df[df["series"].isin(selected_series) & df["cap_category"].isin(selected_caps)]
+    filtered = df[
+        df["series"].isin(selected_series)
+        & df["cap_category"].isin(selected_caps)
+        & df["sector"].isin(selected_sectors)
+    ]
     if search:
         mask = (
             filtered["symbol"].str.contains(search, case=False, na=False)
@@ -324,7 +361,7 @@ with tab_stocks:
     filtered = filtered.sort_values(sort_col, ascending=not sort_desc)
 
     st.dataframe(
-        filtered[["symbol", "name", "series", "cap_category", "market_cap_cr",
+        filtered[["symbol", "name", "series", "sector", "cap_category", "market_cap_cr",
                   "close", "prev_close", "chg_pct"]]
         .rename(columns={
             "cap_category": "cap", "market_cap_cr": "mkt cap (₹cr)",
@@ -340,15 +377,17 @@ with tab_stocks:
     )
 
     st.divider()
-    top_gainers = df.sort_values("chg_pct", ascending=False).head(10)
-    top_losers = df.sort_values("chg_pct", ascending=True).head(10)
+    # Gainers/losers honour the filters above, so narrowing to one sector shows
+    # that sector's movers rather than the whole market's.
+    top_gainers = filtered.sort_values("chg_pct", ascending=False).head(10)
+    top_losers = filtered.sort_values("chg_pct", ascending=True).head(10)
     gcol, lcol = st.columns(2)
     with gcol:
         st.subheader("Top gainers")
-        st.dataframe(top_gainers[["symbol", "series", "cap_category", "close", "chg_pct"]], hide_index=True, use_container_width=True)
+        st.dataframe(top_gainers[["symbol", "sector", "cap_category", "close", "chg_pct"]], hide_index=True, use_container_width=True)
     with lcol:
         st.subheader("Top losers")
-        st.dataframe(top_losers[["symbol", "series", "cap_category", "close", "chg_pct"]], hide_index=True, use_container_width=True)
+        st.dataframe(top_losers[["symbol", "sector", "cap_category", "close", "chg_pct"]], hide_index=True, use_container_width=True)
 
 # ==================================================== Tab 2: Returns calculator
 with tab_returns:
@@ -383,6 +422,7 @@ with tab_returns:
         ret_df = ret_df.merge(shares_df, on="symbol", how="left")
         ret_df["market_cap_cr"] = (ret_df["shares_outstanding"] * ret_df["close_end"] / 1e7).round(1)
         ret_df["cap_category"] = ret_df["market_cap_cr"].apply(cap_category)
+        ret_df = with_sector(ret_df, sectors_df)
 
         # Yahoo's raw feed has occasional bad ticks for thinly-traded ETFs/funds
         # (e.g. a gold or index fund showing a ~100x jump between two days that
@@ -406,9 +446,15 @@ with tab_returns:
         series_opt = sorted(ret_df["series"].dropna().unique().tolist())
         sel_series = st.multiselect("Series", series_opt, default=series_opt, key="ret_series")
         sel_caps = st.multiselect("Market cap", CAP_CATEGORIES, default=CAP_CATEGORIES, key="ret_cap")
+        ret_sector_opts = sector_options(ret_df)
+        sel_sectors = st.multiselect("Sector", ret_sector_opts, default=ret_sector_opts, key="ret_sector")
         ret_search = st.text_input("Search symbol or name", "", key="ret_search")
 
-        ret_filtered = ret_clean[ret_clean["series"].isin(sel_series) & ret_clean["cap_category"].isin(sel_caps)]
+        ret_filtered = ret_clean[
+            ret_clean["series"].isin(sel_series)
+            & ret_clean["cap_category"].isin(sel_caps)
+            & ret_clean["sector"].isin(sel_sectors)
+        ]
         if ret_search:
             mask = (
                 ret_filtered["symbol"].str.contains(ret_search, case=False, na=False)
@@ -418,7 +464,7 @@ with tab_returns:
 
         ret_filtered = ret_filtered.sort_values("return_pct", ascending=False)
         st.dataframe(
-            ret_filtered[["symbol", "name", "series", "cap_category", "market_cap_cr",
+            ret_filtered[["symbol", "name", "series", "sector", "cap_category", "market_cap_cr",
                           "close_start", "close_end", "return_pct"]]
             .rename(columns={
                 "cap_category": "cap", "market_cap_cr": "mkt cap (₹cr)",
@@ -500,7 +546,8 @@ with tab_indices:
 
 # ==================================================== Tab 4: Watchlist
 with tab_watchlist:
-    today_df = with_market_cap(load_day(dates[-1]), shares_df)
+    today_df = with_sector(with_market_cap(load_day(dates[-1]), shares_df), sectors_df)
+    sector_by_symbol = dict(zip(today_df["symbol"], today_df["sector"]))
     symbol_lookup = today_df.set_index("symbol")[["name", "series"]].to_dict("index")
     symbol_options = sorted(f"{s} — {info['name']}" for s, info in symbol_lookup.items())
 
@@ -509,7 +556,7 @@ with tab_watchlist:
         # Keep watchlist order rather than whatever order the merge produced.
         rows["_order"] = rows["symbol"].apply(symbols.index)
         rows = rows.sort_values("_order").drop(columns="_order")
-        return rows[["symbol", "name", "series", "cap_category", "market_cap_cr", "close", "chg_pct"]]
+        return rows[["symbol", "name", "sector", "cap_category", "market_cap_cr", "close", "chg_pct"]]
 
     # Personal list lives in the database (survives restarts, same on every
     # device). Common list stays per-visitor and temporary, as specified.
@@ -524,10 +571,22 @@ with tab_watchlist:
             st.caption("Empty — add a stock below.")
             return
         table = _watchlist_table(symbols)
+        opts = sector_options(table)
+        if len(opts) > 1:
+            chosen_sectors = st.multiselect(
+                "Sector", opts, default=opts, key=f"{key_prefix}_sector"
+            )
+            table = table[table["sector"].isin(chosen_sectors)]
         st.dataframe(
             table.rename(columns={"cap_category": "cap", "market_cap_cr": "mkt cap (₹cr)"}),
             use_container_width=True, hide_index=True,
         )
+        if not table.empty:
+            by_sector = (table.groupby("sector")["chg_pct"].agg(["count", "mean"])
+                         .rename(columns={"count": "stocks", "mean": "avg chg %"})
+                         .round(2).sort_values("avg chg %", ascending=False))
+            st.caption("By sector")
+            st.dataframe(by_sector, use_container_width=True)
         remove_sym = st.selectbox(
             "Remove a stock", ["—"] + symbols, key=f"{key_prefix}_remove_select"
         )
@@ -580,6 +639,7 @@ with tab_watchlist:
         w_ret = pd.DataFrame({
             "symbol": present,
             "name": df_end.loc[present, "name"].values,
+            "sector": [sector_by_symbol.get(sym, UNKNOWN_SECTOR) for sym in present],
             "close_start": df_start.loc[present, "close"].values,
             "close_end": df_end.loc[present, "close"].values,
         })

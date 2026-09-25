@@ -30,6 +30,14 @@ jobs:
       - name: Refresh symbol master from NSE
         run: python scripts/refresh_symbol_master.py
 
+      # Sectors come from NSE's own index constituent lists (free, no auth, no
+      # rate limit) rather than Yahoo's per-symbol .info endpoint, which rate
+      # limits hard at this volume.
+      - name: Refresh sector classification from NSE
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/fetch_sectors.py
+
       - name: Refresh shares outstanding from Yahoo Finance
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}

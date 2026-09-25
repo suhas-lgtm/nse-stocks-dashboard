@@ -57,6 +57,15 @@ SCHEMA_STATEMENTS = [
         PRIMARY KEY (list_type, symbol)
     )
     """,
+    # NSE's own sector classification, keyed by symbol. Kept in its own table
+    # rather than a column on daily_prices: it changes a few times a year, not
+    # daily, so repeating it on every one of ~645k price rows would be waste.
+    """
+    CREATE TABLE IF NOT EXISTS symbol_sector (
+        symbol  TEXT PRIMARY KEY,
+        sector  TEXT
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS meta (
         key    TEXT PRIMARY KEY,
