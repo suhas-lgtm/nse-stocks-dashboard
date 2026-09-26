@@ -314,6 +314,29 @@ def load_52w(as_of: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=600)
+def load_price_series(symbol: str) -> pd.DataFrame:
+    """Full stored history for one symbol, oldest first."""
+    return pd.read_sql(
+        text("""SELECT date::text AS date, open, high, low, close, volume
+                FROM daily_prices WHERE symbol = :s ORDER BY date"""),
+        get_db(), params={"s": symbol},
+    )
+
+
+@st.cache_data(ttl=600)
+def load_volume_average(as_of: str, days: int = 20) -> pd.DataFrame:
+    """Average daily volume over the trailing window, per symbol."""
+    return pd.read_sql(
+        text(f"""SELECT symbol, AVG(volume) AS avg_volume
+                 FROM daily_prices
+                 WHERE date <= CAST(:d AS date)
+                   AND date >  CAST(:d AS date) - INTERVAL '{int(days)} days'
+                 GROUP BY symbol"""),
+        get_db(), params={"d": as_of},
+    )
+
+
+@st.cache_data(ttl=600)
 def load_sectors() -> pd.DataFrame:
     """Sector per symbol. Returns an empty frame if the table isn't there yet,
     so a deploy that lands before the first sector fetch degrades to showing
@@ -456,6 +479,54 @@ def with_52w(df: pd.DataFrame, as_of: str) -> pd.DataFrame:
     return merged
 
 
+def enriched_day(date_str: str) -> pd.DataFrame:
+    """One trading day with every derived column the tabs share."""
+    d = with_sector(with_market_cap(load_day(date_str), shares_df), sectors_df)
+    as_of = d["date"].iloc[0] if not d.empty else date_str
+    try:
+        d = with_period_returns(d, as_of, dates)
+        d = with_52w(d, as_of)
+    except Exception as exc:
+        st.warning(f"Period-return and 52-week columns unavailable: {exc}")
+    return d
+
+
+# Columns that read better green-above-zero / red-below.
+SIGNED_COLUMNS = {
+    "chg %", "chg_pct", "1W %", "1M %", "3M %", "6M %", "1Y %",
+    "return %", "return_pct", "off high %", "off_high_pct", "P&L", "P&L %",
+    "avg chg %", "gap %", "day chg %",
+}
+# Styling every cell is slow; past this many rows show the plain table.
+MAX_STYLED_ROWS = 400
+
+
+def show_table(df: pd.DataFrame, **kwargs) -> None:
+    """st.dataframe with green/up, red/down colouring on signed columns."""
+    cols = [c for c in df.columns if c in SIGNED_COLUMNS]
+    if not cols or len(df) > MAX_STYLED_ROWS:
+        st.dataframe(df, **kwargs)
+        return
+
+    def colour(v):
+        if pd.isna(v) or not isinstance(v, (int, float)):
+            return ""
+        if v > 0:
+            return "color: #34D399"
+        if v < 0:
+            return "color: #F87171"
+        return "color: #5E6F8F"
+
+    st.dataframe(df.style.map(colour, subset=cols), **kwargs)
+
+
+def download_button(df: pd.DataFrame, filename: str, key: str) -> None:
+    st.download_button(
+        "Download CSV", df.to_csv(index=False).encode("utf-8"),
+        file_name=filename, mime="text/csv", key=key,
+    )
+
+
 def sector_options(df: pd.DataFrame) -> list[str]:
     """Sector names for a filter, with "Unknown" pushed to the end."""
     present = sorted(set(df["sector"].dropna()) - {UNKNOWN_SECTOR})
@@ -552,9 +623,15 @@ if not indices_df.empty:
     st.caption(f"Popular indices as of {latest_idx_date} · full list under the \"All Indices\" tab")
     st.divider()
 
-tab_stocks, tab_returns, tab_indices, tab_watchlist = st.tabs(
-    ["Stocks", "Returns calculator", "All Indices", "Watchlist"]
+(tab_stocks, tab_detail, tab_sectors, tab_scanners, tab_screener,
+ tab_returns, tab_indices, tab_watchlist) = st.tabs(
+    ["Stocks", "Stock detail", "Sectors", "Scanners", "Screener",
+     "Returns calculator", "All Indices", "Watchlist"]
 )
+
+# The newest trading day, enriched once and shared by the tabs that always
+# look at "today" rather than a user-picked date.
+latest_df = enriched_day(dates[-1])
 
 # ============================================================ Tab 1: Stocks
 with tab_stocks:
@@ -567,19 +644,8 @@ with tab_stocks:
         st.caption(f"No trading data for {selected_date}; showing {fallback} instead.")
         selected_date_str = fallback
 
-    df = load_day(selected_date_str)
-    df = with_market_cap(df, shares_df)
-    df = with_sector(df, sectors_df)
-    # The history-derived columns are extras: every downstream use of them is
-    # already conditional on the column existing, so a failure here should cost
-    # those columns, not the whole page. Streamlit runs the script top to
-    # bottom, so an uncaught error in this tab blanks all four of them.
-    as_of_for_history = df["date"].iloc[0] if not df.empty else selected_date_str
-    try:
-        df = with_period_returns(df, as_of_for_history, dates)
-        df = with_52w(df, as_of_for_history)
-    except Exception as exc:
-        st.warning(f"Period-return and 52-week columns unavailable: {exc}")
+    df = (latest_df if selected_date_str == dates[-1]
+          else enriched_day(selected_date_str))
     as_of = df["date"].iloc[0] if not df.empty else selected_date_str
     st.caption(f"Data as of {as_of} · Source: Yahoo Finance · {len(df):,} securities")
 
@@ -690,6 +756,260 @@ with tab_stocks:
     with lcol:
         st.subheader("Top losers")
         st.dataframe(top_losers[["symbol", "sector", "cap_category", "close", "chg_pct"]], hide_index=True, use_container_width=True)
+
+# ====================================================== Tab 2: Stock detail
+with tab_detail:
+    st.caption("One stock at a time: price history, returns, and how it sits "
+               "against its sector.")
+    detail_options = sorted(latest_df["symbol"].tolist())
+    default_ix = detail_options.index("RELIANCE") if "RELIANCE" in detail_options else 0
+    sym = st.selectbox("Stock", detail_options, index=default_ix, key="detail_sym")
+
+    row = latest_df[latest_df["symbol"] == sym]
+    if row.empty:
+        st.info("No data for that symbol on the latest trading day.")
+    else:
+        r = row.iloc[0]
+        st.markdown(f"### {sym} — {r['name']}")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Close", f"₹{r['close']:,.2f}",
+                  f"{r['chg_pct']:+.2f}%" if pd.notna(r["chg_pct"]) else None)
+        c2.metric("Sector", r["sector"])
+        c3.metric("Market cap",
+                  f"₹{r['market_cap_cr']:,.0f}cr" if pd.notna(r["market_cap_cr"]) else "—")
+        if "off_high_pct" in row.columns and pd.notna(r.get("off_high_pct")):
+            c4.metric("Off 52w high", f"{r['off_high_pct']:.2f}%")
+
+        # Where it sits in the 52-week range, as a 0-100 position.
+        if "high_52w" in row.columns and pd.notna(r.get("high_52w")):
+            lo, hi = r["low_52w"], r["high_52w"]
+            if hi > lo:
+                pos = (r["close"] - lo) / (hi - lo)
+                st.caption(f"52-week range: ₹{lo:,.2f} — ₹{hi:,.2f} "
+                           f"(currently {pos:.0%} of the way up)")
+                st.progress(min(max(float(pos), 0.0), 1.0))
+
+        series = load_price_series(sym)
+        if series.empty:
+            st.info("No stored history for this symbol.")
+        else:
+            st.markdown("### Price history")
+            st.line_chart(series.set_index("date")["close"], height=280)
+            with st.expander("Volume"):
+                st.bar_chart(series.set_index("date")["volume"], height=200)
+
+        ret_cols = [c for c in ["ret_1W", "ret_1M", "ret_3M", "ret_6M", "ret_1Y"]
+                    if c in row.columns]
+        if ret_cols:
+            st.markdown("### Returns")
+            rets = pd.DataFrame({
+                "period": [c.replace("ret_", "") for c in ret_cols],
+                "return %": [r[c] for c in ret_cols],
+            })
+            show_table(rets, hide_index=True, use_container_width=True)
+
+        peers = latest_df[(latest_df["sector"] == r["sector"])
+                          & (latest_df["sector"] != UNKNOWN_SECTOR)]
+        if len(peers) > 1:
+            st.markdown(f"### Sector peers — {r['sector']}")
+            sort_by = "ret_1Y" if "ret_1Y" in peers.columns else "chg_pct"
+            peers = peers.sort_values(sort_by, ascending=False)
+            cols = [c for c in ["symbol", "name", "market_cap_cr", "close",
+                                "chg_pct", "ret_1M", "ret_1Y"] if c in peers.columns]
+            table = peers[cols].rename(columns={
+                "market_cap_cr": "mkt cap (₹cr)", "chg_pct": "chg %",
+                "ret_1M": "1M %", "ret_1Y": "1Y %"})
+            rank = list(peers["symbol"]).index(sym) + 1
+            st.caption(f"{sym} ranks {rank} of {len(peers)} in its sector "
+                       f"by {'1-year return' if sort_by == 'ret_1Y' else 'day change'}.")
+            show_table(table, hide_index=True, use_container_width=True, height=320)
+            download_button(table, f"{sym}_sector_peers.csv", "dl_peers")
+
+
+# ========================================================== Tab 3: Sectors
+with tab_sectors:
+    known = latest_df[latest_df["sector"] != UNKNOWN_SECTOR]
+    if known.empty:
+        st.info("No sector data yet. Run the monthly workflow "
+                "(`scripts/fetch_sectors.py`) to populate it.")
+    else:
+        as_of_sec = latest_df["date"].iloc[0]
+        st.caption(f"Sector performance for {as_of_sec} · "
+                   f"{len(known):,} classified stocks")
+
+        agg = known.groupby("sector").agg(
+            stocks=("symbol", "count"),
+            advancers=("chg_pct", lambda x: int((x > 0).sum())),
+            decliners=("chg_pct", lambda x: int((x < 0).sum())),
+            avg_chg=("chg_pct", "mean"),
+        ).round(2)
+        for label, col in [("1M", "ret_1M"), ("1Y", "ret_1Y")]:
+            if col in known.columns:
+                agg[f"avg {label} %"] = known.groupby("sector")[col].mean().round(2)
+        agg = agg.rename(columns={"avg_chg": "avg chg %"}).sort_values(
+            "avg chg %", ascending=False).reset_index()
+
+        st.markdown("### Today by sector")
+        st.bar_chart(agg.set_index("sector")["avg chg %"], height=320)
+        show_table(agg, hide_index=True, use_container_width=True)
+        download_button(agg, f"sector_summary_{as_of_sec}.csv", "dl_sectors")
+
+        st.markdown("### Best and worst in each sector")
+        best_worst = []
+        for sector, grp in known.groupby("sector"):
+            grp = grp.dropna(subset=["chg_pct"])
+            if grp.empty:
+                continue
+            top, bottom = grp.loc[grp["chg_pct"].idxmax()], grp.loc[grp["chg_pct"].idxmin()]
+            best_worst.append({
+                "sector": sector,
+                "best": top["symbol"], "best chg %": top["chg_pct"],
+                "worst": bottom["symbol"], "worst chg %": bottom["chg_pct"],
+            })
+        if best_worst:
+            bw = pd.DataFrame(best_worst).sort_values("sector")
+            st.dataframe(bw, hide_index=True, use_container_width=True, height=400)
+
+
+# ========================================================= Tab 4: Scanners
+with tab_scanners:
+    as_of_scan = latest_df["date"].iloc[0]
+    st.caption(f"What stood out on {as_of_scan}.")
+
+    liquid_only = st.checkbox(
+        "Exclude stocks with no volume (illiquid/suspended)", value=True,
+        key="scan_liquid")
+    base = latest_df.copy()
+    if liquid_only:
+        base = base[base["volume"].fillna(0) > 0]
+
+    st.markdown("### New 52-week highs and lows")
+    if "high_52w" not in base.columns:
+        st.info("52-week data unavailable.")
+    else:
+        # Within a whisker of the extreme counts as making it — the stored high
+        # includes today, so an exact equality test is what "new high" means.
+        highs = base[base["close"] >= base["high_52w"] * 0.999]
+        lows = base[base["close"] <= base["low_52w"] * 1.001]
+        hc, lc = st.columns(2)
+        with hc:
+            st.caption(f"{len(highs)} at a 52-week high")
+            cols = [c for c in ["symbol", "sector", "close", "chg_pct", "high_52w"]
+                    if c in highs.columns]
+            t = highs.sort_values("chg_pct", ascending=False)[cols].rename(
+                columns={"chg_pct": "chg %", "high_52w": "52w high"})
+            show_table(t, hide_index=True, use_container_width=True, height=300)
+            download_button(t, f"new_highs_{as_of_scan}.csv", "dl_highs")
+        with lc:
+            st.caption(f"{len(lows)} at a 52-week low")
+            cols = [c for c in ["symbol", "sector", "close", "chg_pct", "low_52w"]
+                    if c in lows.columns]
+            t = lows.sort_values("chg_pct")[cols].rename(
+                columns={"chg_pct": "chg %", "low_52w": "52w low"})
+            show_table(t, hide_index=True, use_container_width=True, height=300)
+            download_button(t, f"new_lows_{as_of_scan}.csv", "dl_lows")
+
+    st.markdown("### Volume spikes")
+    try:
+        vol_avg = load_volume_average(as_of_scan, 20)
+        vs = base.merge(vol_avg, on="symbol", how="left")
+        vs = vs[vs["avg_volume"].fillna(0) > 0]
+        vs["volume x avg"] = (vs["volume"] / vs["avg_volume"]).round(2)
+        threshold = st.slider("Minimum multiple of 20-day average volume",
+                              1.5, 10.0, 3.0, 0.5, key="scan_vol_mult")
+        spikes = vs[vs["volume x avg"] >= threshold].sort_values(
+            "volume x avg", ascending=False)
+        st.caption(f"{len(spikes)} stocks traded at least {threshold:g}x "
+                   f"their 20-day average volume")
+        cols = [c for c in ["symbol", "sector", "close", "chg_pct",
+                            "volume", "avg_volume", "volume x avg"]
+                if c in spikes.columns]
+        t = spikes[cols].rename(columns={"chg_pct": "chg %", "avg_volume": "20d avg vol"})
+        show_table(t, hide_index=True, use_container_width=True, height=340)
+        download_button(t, f"volume_spikes_{as_of_scan}.csv", "dl_vol")
+    except Exception as exc:
+        st.warning(f"Volume scanner unavailable: {exc}")
+
+    st.markdown("### Gap ups and gap downs")
+    gaps = base.dropna(subset=["open", "prev_close"]).copy()
+    gaps = gaps[gaps["prev_close"] > 0]
+    gaps["gap %"] = ((gaps["open"] - gaps["prev_close"]) / gaps["prev_close"] * 100).round(2)
+    gap_min = st.slider("Minimum gap size (%)", 1.0, 20.0, 5.0, 0.5, key="scan_gap")
+    gapped = gaps[gaps["gap %"].abs() >= gap_min].sort_values("gap %", ascending=False)
+    st.caption(f"{len(gapped)} stocks opened at least {gap_min:g}% away from "
+               f"the previous close")
+    cols = [c for c in ["symbol", "sector", "prev_close", "open", "close",
+                        "gap %", "chg_pct"] if c in gapped.columns]
+    t = gapped[cols].rename(columns={"prev_close": "prev close", "chg_pct": "chg %"})
+    show_table(t, hide_index=True, use_container_width=True, height=340)
+    download_button(t, f"gaps_{as_of_scan}.csv", "dl_gaps")
+
+
+# ========================================================= Tab 5: Screener
+with tab_screener:
+    st.caption("Stack conditions freely. Every filter is optional — leave one "
+               "blank to ignore it.")
+    scr = latest_df.copy()
+    as_of_scr = scr["date"].iloc[0]
+
+    c1, c2, c3 = st.columns(3)
+    scr_sectors = c1.multiselect("Sector", sector_options(scr),
+                                 default=[], key="scr_sector")
+    scr_caps = c2.multiselect("Market cap band", CAP_CATEGORIES,
+                              default=[], key="scr_cap")
+    scr_series = c3.multiselect("Series",
+                                sorted(scr["series"].dropna().unique().tolist()),
+                                default=[], key="scr_series")
+    if scr_sectors:
+        scr = scr[scr["sector"].isin(scr_sectors)]
+    if scr_caps:
+        scr = scr[scr["cap_category"].isin(scr_caps)]
+    if scr_series:
+        scr = scr[scr["series"].isin(scr_series)]
+
+    # Numeric conditions, each "column >= min" and/or "column <= max".
+    NUMERIC_FILTERS = [
+        ("Market cap (₹cr)", "market_cap_cr"),
+        ("Day change %", "chg_pct"),
+        ("1M return %", "ret_1M"),
+        ("3M return %", "ret_3M"),
+        ("1Y return %", "ret_1Y"),
+        ("Off 52-week high %", "off_high_pct"),
+        ("Close (₹)", "close"),
+    ]
+    st.markdown("### Numeric conditions")
+    for label, col in NUMERIC_FILTERS:
+        if col not in scr.columns:
+            continue
+        a, b = st.columns(2)
+        lo = a.number_input(f"{label} — min", value=None, step=1.0,
+                            placeholder="any", key=f"scr_{col}_min")
+        hi = b.number_input(f"{label} — max", value=None, step=1.0,
+                            placeholder="any", key=f"scr_{col}_max")
+        if lo is not None:
+            scr = scr[scr[col] >= lo]
+        if hi is not None:
+            scr = scr[scr[col] <= hi]
+
+    st.markdown("### Results")
+    st.caption(f"{len(scr):,} stocks match, as of {as_of_scr}")
+    sort_options = [c for c in ["chg_pct", "ret_1M", "ret_3M", "ret_1Y",
+                                "market_cap_cr", "off_high_pct", "symbol"]
+                    if c in scr.columns]
+    if sort_options:
+        scr_sort = st.selectbox("Sort by", sort_options, key="scr_sort")
+        scr = scr.sort_values(scr_sort, ascending=False)
+
+    cols = [c for c in ["symbol", "name", "sector", "cap_category", "market_cap_cr",
+                        "close", "chg_pct", "ret_1M", "ret_3M", "ret_1Y",
+                        "off_high_pct"] if c in scr.columns]
+    table = scr[cols].rename(columns={
+        "cap_category": "cap", "market_cap_cr": "mkt cap (₹cr)", "chg_pct": "chg %",
+        "ret_1M": "1M %", "ret_3M": "3M %", "ret_1Y": "1Y %",
+        "off_high_pct": "off high %"})
+    show_table(table, hide_index=True, use_container_width=True, height=520)
+    download_button(table, f"screen_{as_of_scr}.csv", "dl_screen")
+
 
 # ==================================================== Tab 2: Returns calculator
 with tab_returns:

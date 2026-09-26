@@ -30,6 +30,13 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Render the dashboard headlessly against fixtures. Catches broken
+      # column references and bad maths across every tab without a browser.
+      - name: Render dashboard (headless)
+        run: |
+          python tests/render_dashboard.py
+          FAKE_ST_AGGRESSIVE=1 python tests/render_dashboard.py
+
       # Fail in seconds, not after a ten-minute download, if the database
       # is unreachable or the DATABASE_URL secret is missing.
       - name: Check database connection
@@ -40,6 +47,14 @@ jobs:
       # Data now goes straight into Postgres — nothing is committed back to the
       # repo, so the dashboard picks up fresh data without a redeploy (which
       # used to restart the app and wipe watchlists twice a day).
+      # Run every query the dashboard issues against the real database. The
+      # headless render stubs SQL, so this is what catches a query that is
+      # valid Python and invalid Postgres.
+      - name: Smoke-test dashboard queries
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/smoke_test_queries.py
+
       - name: Fetch prices from Yahoo Finance
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
