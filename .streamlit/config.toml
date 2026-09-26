@@ -1,7 +1,10 @@
+# Armstrong Capital "P8" palette, matching the MF Research Center dashboard.
+# Source of truth for these values is that project's tailwind.config.js /
+# src/index.css — keep the two in step if the house palette changes.
 [theme]
 base = "dark"
-primaryColor = "#4a90ff"
-backgroundColor = "#06070a"
-secondaryBackgroundColor = "#12141a"
-textColor = "#f4f5f7"
+primaryColor = "#3B82F6"              # equity blue
+backgroundColor = "#0B1120"           # --bg-base
+secondaryBackgroundColor = "#111A2E"  # --bg-card
+textColor = "#F1F5FB"                 # --text-hi
 font = "sans serif"

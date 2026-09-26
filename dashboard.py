@@ -18,66 +18,158 @@ IST = ZoneInfo("Asia/Kolkata")
 # A deterrent against casual edits from anyone with the link, not real security.
 WATCHLIST_PASSWORD_HASH = "7a759a779365ae885791dfa59c42d0a86ed7f7d078c793db022cceab9514c136"
 
-st.set_page_config(page_title="NSE Stocks Dashboard", layout="wide", page_icon="📈")
+# page_icon takes a path; assets/logo.png is the same pulse mark the MF
+# Research Center uses as its favicon, so browser tabs match across both.
+_ICON = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logo.png")
+st.set_page_config(page_title="NSE Research Center — Armstrong Capital",
+                   layout="wide",
+                   page_icon=_ICON if os.path.exists(_ICON) else "📈")
 
 st.markdown("""
 <style>
-[data-testid="stAppViewContainer"] {
-    background:
-        radial-gradient(680px 320px at 12% -10%, rgba(74,144,255,0.10), transparent 60%),
-        radial-gradient(520px 260px at 88% -6%, rgba(124,92,255,0.08), transparent 60%),
-        #06070a;
-}
-[data-testid="stHeader"] { background: transparent; }
+/* ── Armstrong Capital design system ─────────────────────────────────────
+   Tokens lifted from the MF Research Center project (site/src/index.css) so
+   the two dashboards read as one product. Keep in step if the house palette
+   changes there. */
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@300;400;500;600;700&family=Inter:wght@300;400;500;600;700&display=swap');
 
+:root {
+    --bg-base:   #0B1120;
+    --bg-card:   #111A2E;
+    --bg-raised: #18233C;
+    --line:      #24314F;
+    --text-hi:   #F1F5FB;
+    --text-mid:  #9FB0CC;
+    --text-low:  #5E6F8F;
+    --equity:    #3B82F6;
+    --accent-a:  #22D3EE;
+    --accent-b:  #F472B6;
+    --gain:      #34D399;
+    --loss:      #F87171;
+    --font-display: 'Space Grotesk', sans-serif;
+    --font-ui:      'Inter', sans-serif;
+    --radius-card:  10px;
+    --shadow-card:  0 4px 24px 0 rgba(0,0,0,0.45);
+    --transition:   140ms cubic-bezier(0.4,0,0.2,1);
+}
+
+[data-testid="stAppViewContainer"] { background: var(--bg-base); }
+[data-testid="stHeader"] { background: transparent; }
+html, body, [data-testid="stAppViewContainer"] * { font-family: var(--font-ui); }
+h1, h2, h3, h4 { font-family: var(--font-display) !important; }
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: var(--bg-base); }
+::-webkit-scrollbar-thumb { background: var(--line); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: var(--text-low); }
+
+/* Cards — metrics reuse the .card treatment */
 [data-testid="stMetric"] {
-    background: linear-gradient(160deg, #181b22, #12141a);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 10px;
+    background: var(--bg-card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-card);
+    box-shadow: var(--shadow-card);
     padding: 14px 16px 10px;
-    box-shadow: 0 6px 16px rgba(0,0,0,0.25);
 }
 [data-testid="stMetricValue"] {
+    font-family: var(--font-display);
     font-variant-numeric: tabular-nums;
-    font-family: ui-monospace, "SFMono-Regular", "Cascadia Code", Consolas, monospace;
 }
-[data-testid="stMetricLabel"] { color: #9aa1ae; }
+[data-testid="stMetricLabel"] { color: var(--text-mid); }
 
-.stTabs [data-baseweb="tab-list"] { gap: 4px; border-bottom: 1px solid #23262f; }
-.stTabs [data-baseweb="tab"] { color: #9aa1ae; font-weight: 600; }
-.stTabs [aria-selected="true"] { color: #f4f5f7 !important; }
+/* Section headers get the accent bar from the MF dashboard */
+h3 {
+    display: flex; align-items: center; gap: 0.5rem;
+    padding-bottom: 0.75rem; margin-bottom: 1rem;
+    border-bottom: 1px solid var(--line);
+}
+h3::before {
+    content: ''; width: 4px; height: 1.25rem; border-radius: 2px; flex-shrink: 0;
+    background: linear-gradient(180deg, var(--accent-a), var(--accent-b));
+}
+
+.stTabs [data-baseweb="tab-list"] { gap: 4px; border-bottom: 1px solid var(--line); }
+.stTabs [data-baseweb="tab"] {
+    color: var(--text-mid); font-weight: 600; font-family: var(--font-display);
+}
+.stTabs [aria-selected="true"] { color: var(--text-hi) !important; }
 
 [data-testid="stDataFrame"] {
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 10px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-card);
     overflow: hidden;
 }
 
-.nse-header { display: flex; align-items: center; gap: 12px; margin-bottom: 8px; }
-.nse-brand-mark {
-    width: 40px; height: 40px; border-radius: 10px; flex: none;
-    background: linear-gradient(135deg, #4a90ff, #7c5cff);
-    display: flex; align-items: center; justify-content: center;
-    box-shadow: 0 4px 16px rgba(74,144,255,0.35);
+/* ── Gradient hero header ─────────────────────────────────────────────── */
+.ac-hero {
+    position: relative;
+    background: linear-gradient(120deg, #0B1120 0%, #16224A 50%, #1E3A8A 100%);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-card);
+    padding: 14px 18px;
+    margin-bottom: 14px;
+    display: flex; align-items: center; gap: 14px;
 }
-.nse-title { font-size: 27px; font-weight: 700; margin: 0; color: #f4f5f7; line-height: 1.2; }
-.nse-subtitle { font-size: 13px; color: #9aa1ae; margin: 2px 0 0; }
+.ac-hero::after {
+    content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 1px;
+    background: linear-gradient(90deg, transparent, var(--accent-a), transparent);
+    opacity: 0.6; pointer-events: none;
+}
+/* The logo sits on a white chip, as in the MF header — the mark is dark and
+   would disappear against the navy gradient otherwise. */
+.ac-logo-chip {
+    background: #fff; border-radius: 6px; padding: 2px 6px; height: 40px;
+    display: flex; align-items: center; justify-content: center; flex: none;
+    border: 1px solid rgba(255,255,255,0.3);
+    box-shadow: 0 1px 6px rgba(0,0,0,0.18);
+}
+.ac-logo-chip img { height: 28px; width: auto; object-fit: contain; display: block; }
+.ac-title {
+    font-family: var(--font-display); font-weight: 700; font-size: 20px;
+    letter-spacing: 0.03em; color: #fff; margin: 0; line-height: 1.25;
+}
+.ac-subtitle {
+    font-size: 11px; color: rgba(255,255,255,0.5);
+    letter-spacing: 0.03em; margin: 2px 0 0;
+}
+.ac-badge {
+    display: inline-flex; align-items: center; padding: 0.125rem 0.5rem;
+    border-radius: 4px; font-size: 0.625rem; font-weight: 700;
+    letter-spacing: 0.08em; text-transform: uppercase;
+    background: rgba(251,146,60,0.15); color: #FB923C;
+    border: 1px solid rgba(251,146,60,0.3); margin-left: auto;
+}
 
+/* ── Index tiles ──────────────────────────────────────────────────────── */
 .nse-idx-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 4px; }
 .nse-idx-tile {
     flex: 1 1 160px; min-width: 150px;
-    background: linear-gradient(160deg, #181b22, #12141a);
-    border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 10px;
+    background: var(--bg-card);
+    border: 1px solid var(--line);
+    border-radius: var(--radius-card);
     padding: 12px 14px;
-    box-shadow: 0 6px 16px rgba(0,0,0,0.25);
+    box-shadow: var(--shadow-card);
+    transition: transform var(--transition), box-shadow var(--transition);
 }
-.nse-idx-name { font-size: 10.5px; font-weight: 700; letter-spacing: 0.03em; color: #9aa1ae; text-transform: uppercase; }
-.nse-idx-value { font-size: 18px; font-weight: 600; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; color: #f4f5f7; }
-.nse-idx-delta { font-size: 12px; font-weight: 600; font-family: ui-monospace, "SFMono-Regular", Consolas, monospace; margin-left: 6px; }
-.nse-up { color: #22c55e; }
-.nse-down { color: #f5504f; }
-.nse-flat { color: #676e7a; }
+.nse-idx-tile:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+}
+.nse-idx-name {
+    font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em;
+    color: var(--text-mid); text-transform: uppercase;
+}
+.nse-idx-value {
+    font-size: 18px; font-weight: 600; font-family: var(--font-display);
+    font-variant-numeric: tabular-nums; color: var(--text-hi);
+}
+.nse-idx-delta {
+    font-size: 12px; font-weight: 600; font-family: var(--font-display);
+    font-variant-numeric: tabular-nums; margin-left: 6px;
+}
+.nse-up { color: var(--gain); }
+.nse-down { color: var(--loss); }
+.nse-flat { color: var(--text-low); }
 </style>
 """, unsafe_allow_html=True)
 
@@ -336,16 +428,32 @@ POPULAR_INDICES = [
     "NIFTY NEXT 50", "NIFTY MIDCAP 150", "NIFTY SMALLCAP 250", "NIFTY 100", "NIFTY 500",
 ]
 
-st.markdown("""
-<div class="nse-header">
-  <div class="nse-brand-mark">
-    <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="#fff" stroke-width="2"
-         stroke-linecap="round" stroke-linejoin="round"><path d="M4 19V10M10 19V5M16 19V13M22 19V8"/></svg>
-  </div>
+# The logo is inlined as a data URI: Streamlit serves no static files from the
+# app directory, so a plain <img src="assets/logo.jpg"> would 404.
+@st.cache_data
+def _logo_data_uri() -> str:
+    import base64
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "logo.jpg")
+    try:
+        with open(path, "rb") as f:
+            return "data:image/jpeg;base64," + base64.b64encode(f.read()).decode()
+    except OSError:
+        return ""
+
+
+_logo = _logo_data_uri()
+_logo_html = (
+    f'<div class="ac-logo-chip"><img src="{_logo}" alt="Armstrong Capital"></div>'
+    if _logo else ""
+)
+st.markdown(f"""
+<div class="ac-hero">
+  {_logo_html}
   <div>
-    <p class="nse-title">NSE Stocks Dashboard</p>
-    <p class="nse-subtitle">Daily close prices for NSE main-board stocks (EQ, BE, BZ series)</p>
+    <p class="ac-title">NSE Research Center</p>
+    <p class="ac-subtitle">Every Stock, Every Close, Every Day &middot; EQ, BE and BZ series</p>
   </div>
+  <span class="ac-badge">Internal</span>
 </div>
 """, unsafe_allow_html=True)
 
