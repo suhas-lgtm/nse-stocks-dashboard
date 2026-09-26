@@ -63,7 +63,7 @@ def main() -> int:
 
         check("load_day", lambda: str(len(rows(
             """SELECT date::text AS date, symbol, series, name, open, high, low,
-                      close, prev_close, chg_pct, volume, value
+                      close, prev_close, chg_pct, volume
                FROM daily_prices WHERE date = :d""", d=as_of))) + " rows")
 
         check("load_indices", lambda: str(len(rows(

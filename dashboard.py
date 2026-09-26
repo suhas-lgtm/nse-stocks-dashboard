@@ -244,7 +244,7 @@ def available_dates() -> list[str]:
 def load_day(date_str: str) -> pd.DataFrame:
     return pd.read_sql(
         text("""SELECT date::text AS date, symbol, series, name, open, high, low,
-                       close, prev_close, chg_pct, volume, value
+                       close, prev_close, chg_pct, volume
                 FROM daily_prices WHERE date = :d"""),
         get_db(), params={"d": date_str},
     )

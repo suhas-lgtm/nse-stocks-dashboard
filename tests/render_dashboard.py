@@ -57,7 +57,7 @@ def make_day(d):
         "high": np.round(close * 1.05, 2), "low": np.round(close * 0.95, 2),
         "close": close, "prev_close": prev,
         "chg_pct": np.round((close - prev) / prev * 100, 2),
-        "volume": vol, "value": close * vol,
+        "volume": vol,
     })
 
 

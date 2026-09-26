@@ -26,11 +26,11 @@ SCHEMA_STATEMENTS = [
         prev_close  DOUBLE PRECISION,
         chg_pct     DOUBLE PRECISION,
         volume      BIGINT,
-        value       DOUBLE PRECISION,
         PRIMARY KEY (date, symbol)
     )
     """,
-    "CREATE INDEX IF NOT EXISTS idx_daily_prices_date ON daily_prices (date)",
+    # No index on date alone: the primary key is (date, symbol), whose
+    # leading column is date, so it already serves every date lookup.
     "CREATE INDEX IF NOT EXISTS idx_daily_prices_symbol ON daily_prices (symbol)",
     """
     CREATE TABLE IF NOT EXISTS indices_history (

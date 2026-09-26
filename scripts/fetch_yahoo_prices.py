@@ -40,8 +40,7 @@ META_PATH = ROOT / "data" / "meta.json"
 
 OUT_COLUMNS = [
     "date", "symbol", "series", "isin", "name",
-    "open", "high", "low", "close", "prev_close", "chg_pct",
-    "volume", "value",
+    "open", "high", "low", "close", "prev_close", "chg_pct", "volume",
 ]
 
 # Large, highly liquid stocks that should essentially never come back empty.
@@ -135,9 +134,6 @@ def extract_rows(data: pd.DataFrame, batch_rows: list[dict], single: bool) -> tu
             "prev_close": round(float(prev_close), 2) if prev_close else "",
             "chg_pct": chg_pct,
             "volume": int(last["Volume"]) if pd.notna(last["Volume"]) else "",
-            # Approximation (close * volume) — Yahoo doesn't expose NSE's
-            # official traded turnover figure.
-            "value": round(float(close) * float(last["Volume"]), 2) if pd.notna(last["Volume"]) else "",
         })
     return rows, missing
 
@@ -186,7 +182,7 @@ def write_rows_to_db(rows: list[dict]) -> None:
     ]
 
     cols = ["date", "symbol", "series", "name", "open", "high", "low", "close",
-            "prev_close", "chg_pct", "volume", "value"]
+            "prev_close", "chg_pct", "volume"]
     bulk_upsert(
         engine, "daily_prices", cols, payload,
         conflict_cols=["date", "symbol"],
