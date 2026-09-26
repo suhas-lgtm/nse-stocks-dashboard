@@ -210,6 +210,27 @@ def get_db():
     return create_engine(url, pool_pre_ping=True)
 
 
+@st.cache_resource
+def ensure_app_schema() -> None:
+    """Add columns this app needs but an older database may not have.
+
+    The scripts run create_schema() from the GitHub Action, so a deploy can
+    land before the next workflow run and hit a column that does not exist yet
+    — which is exactly what happened with the watchlist holding columns. Both
+    statements are idempotent and run once per process.
+    """
+    try:
+        with get_db().begin() as conn:
+            conn.execute(text(
+                "ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS quantity DOUBLE PRECISION"))
+            conn.execute(text(
+                "ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS buy_price DOUBLE PRECISION"))
+    except Exception:
+        # Read-only credentials or a locked table: watchlist_holdings falls
+        # back to names-only, so the page still works without holdings.
+        pass
+
+
 @st.cache_data(ttl=600)
 def available_dates() -> list[str]:
     with get_db().connect() as conn:
@@ -327,17 +348,34 @@ def watchlist_symbols(list_type: str) -> list[str]:
 def watchlist_holdings(list_type: str) -> dict:
     """{symbol: {"quantity": x, "buy_price": y}} in the order stocks were added.
     Either field may be None — a name can be watched without being held."""
-    with get_db().connect() as conn:
-        rows = conn.execute(
-            text("""SELECT symbol, quantity, buy_price FROM watchlist
-                    WHERE list_type = :t ORDER BY added_at"""),
-            {"t": list_type},
-        ).fetchall()
-    return {r[0]: {"quantity": r[1], "buy_price": r[2]} for r in rows}
+    try:
+        with get_db().connect() as conn:
+            rows = conn.execute(
+                text("""SELECT symbol, quantity, buy_price FROM watchlist
+                        WHERE list_type = :t ORDER BY added_at"""),
+                {"t": list_type},
+            ).fetchall()
+        return {r[0]: {"quantity": r[1], "buy_price": r[2]} for r in rows}
+    except Exception:
+        # Holding columns missing and un-addable — show the list, drop the P&L.
+        return {s: {"quantity": None, "buy_price": None}
+                for s in watchlist_symbols(list_type)}
 
 
 def watchlist_add(list_type: str, symbol: str,
                   quantity=None, buy_price=None) -> None:
+    try:
+        _watchlist_add_with_holding(list_type, symbol, quantity, buy_price)
+    except Exception:
+        with get_db().begin() as conn:
+            conn.execute(
+                text("""INSERT INTO watchlist (list_type, symbol) VALUES (:t, :s)
+                        ON CONFLICT (list_type, symbol) DO NOTHING"""),
+                {"t": list_type, "s": symbol},
+            )
+
+
+def _watchlist_add_with_holding(list_type, symbol, quantity, buy_price) -> None:
     with get_db().begin() as conn:
         conn.execute(
             text("""INSERT INTO watchlist (list_type, symbol, quantity, buy_price)
@@ -484,6 +522,7 @@ if not dates:
 
 min_date = datetime.strptime(dates[0], "%Y-%m-%d").date()
 max_date = datetime.strptime(dates[-1], "%Y-%m-%d").date()
+ensure_app_schema()
 shares_df = load_shares()
 sectors_df = load_sectors()
 
