@@ -108,12 +108,16 @@ def main() -> int:
                FROM daily_prices WHERE symbol = :s ORDER BY date""",
             s="RELIANCE"))) + " bars")
 
-        check("volume_average (scanners)", lambda: str(len(rows(
-            """SELECT symbol, AVG(volume) AS avg_volume
-               FROM daily_prices
-               WHERE date <= CAST(:d AS date)
-                 AND date >  CAST(:d AS date) - INTERVAL '20 days'
-               GROUP BY symbol""", d=as_of))) + " symbols")
+        # Every scanner period, since the window length is interpolated in.
+        for label, days in [("1 week", 7), ("1 month", 30), ("3 months", 91),
+                            ("6 months", 182), ("1 year", 365)]:
+            check(f"load_window_stats ({label})", lambda d=days: str(len(rows(
+                f"""SELECT symbol, MAX(high) AS high_w, MIN(low) AS low_w,
+                           AVG(volume) AS avg_volume
+                    FROM daily_prices
+                    WHERE date <= CAST(:d AS date)
+                      AND date >  CAST(:d AS date) - INTERVAL '{int(d)} days'
+                    GROUP BY symbol""", d=as_of))) + " symbols")
 
     width = max(len(n) for _, n, _ in results)
     failures = 0

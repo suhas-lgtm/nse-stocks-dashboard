@@ -270,6 +270,19 @@ def load_shares() -> pd.DataFrame:
 # Lookback windows for the multi-period return columns, in calendar days.
 RETURN_PERIODS = [("1W", 7), ("1M", 30), ("3M", 91), ("6M", 182), ("1Y", 365)]
 
+# Scanner periods: label -> (calendar days, the already-computed return column
+# for that span). 1 day uses chg_pct, which every row already has.
+SCANNER_PERIODS = {
+    "1 day":    (1,   "chg_pct"),
+    "1 week":   (7,   "ret_1W"),
+    "1 month":  (30,  "ret_1M"),
+    "3 months": (91,  "ret_3M"),
+    "6 months": (182, "ret_6M"),
+    "1 year":   (365, "ret_1Y"),
+}
+# A high/low scan needs a window with more than one bar in it.
+MIN_HIGH_LOW_DAYS = 7
+
 
 @st.cache_data(ttl=600)
 def load_closes_on(date_strs: tuple[str, ...]) -> pd.DataFrame:
@@ -324,10 +337,17 @@ def load_price_series(symbol: str) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=600)
-def load_volume_average(as_of: str, days: int = 20) -> pd.DataFrame:
-    """Average daily volume over the trailing window, per symbol."""
+def load_window_stats(as_of: str, days: int) -> pd.DataFrame:
+    """High, low and average volume over a trailing window, per symbol.
+
+    One query for all three: the scanners want the period high/low and the
+    period average volume together, and daily_prices is indexed on date.
+    """
     return pd.read_sql(
-        text(f"""SELECT symbol, AVG(volume) AS avg_volume
+        text(f"""SELECT symbol,
+                        MAX(high)   AS high_w,
+                        MIN(low)    AS low_w,
+                        AVG(volume) AS avg_volume
                  FROM daily_prices
                  WHERE date <= CAST(:d AS date)
                    AND date >  CAST(:d AS date) - INTERVAL '{int(days)} days'
@@ -874,63 +894,107 @@ with tab_sectors:
 # ========================================================= Tab 4: Scanners
 with tab_scanners:
     as_of_scan = latest_df["date"].iloc[0]
-    st.caption(f"What stood out on {as_of_scan}.")
 
-    liquid_only = st.checkbox(
+    pc1, pc2 = st.columns([2, 3])
+    period_label = pc1.selectbox("Period", list(SCANNER_PERIODS), index=0,
+                                 key="scan_period")
+    period_days, period_ret_col = SCANNER_PERIODS[period_label]
+    liquid_only = pc2.checkbox(
         "Exclude stocks with no volume (illiquid/suspended)", value=True,
         key="scan_liquid")
+
+    st.caption(f"Scanning {period_label.lower()} to {as_of_scan}.")
+
     base = latest_df.copy()
     if liquid_only:
         base = base[base["volume"].fillna(0) > 0]
 
-    st.markdown("### New 52-week highs and lows")
-    if "high_52w" not in base.columns:
-        st.info("52-week data unavailable.")
+    # One query serves the high/low and volume scanners. A one-day window has
+    # a single bar in it, so a high/low scan over it is meaningless — widen to
+    # the minimum and say so rather than showing everything as a "new high".
+    hl_days = max(period_days, MIN_HIGH_LOW_DAYS)
+    stats = None
+    try:
+        stats = load_window_stats(as_of_scan, hl_days)
+        base = base.merge(stats, on="symbol", how="left")
+    except Exception as exc:
+        st.warning(f"Period high/low and volume scanners unavailable: {exc}")
+
+    hl_label = period_label if hl_days == period_days else "1 week"
+
+    # ---- new highs and lows over the period ----
+    st.markdown(f"### New {hl_label} highs and lows")
+    if hl_days != period_days:
+        st.caption("A one-day window holds a single bar, so the high/low scan "
+                   "uses one week instead.")
+    if stats is None or "high_w" not in base.columns:
+        st.info("Not available.")
     else:
-        # Within a whisker of the extreme counts as making it — the stored high
-        # includes today, so an exact equality test is what "new high" means.
-        highs = base[base["close"] >= base["high_52w"] * 0.999]
-        lows = base[base["close"] <= base["low_52w"] * 1.001]
+        highs = base[base["close"] >= base["high_w"] * 0.999]
+        lows = base[base["close"] <= base["low_w"] * 1.001]
         hc, lc = st.columns(2)
         with hc:
-            st.caption(f"{len(highs)} at a 52-week high")
-            cols = [c for c in ["symbol", "sector", "close", "chg_pct", "high_52w"]
+            st.caption(f"{len(highs)} at a {hl_label} high")
+            cols = [c for c in ["symbol", "sector", "close", "chg_pct", "high_w"]
                     if c in highs.columns]
             t = highs.sort_values("chg_pct", ascending=False)[cols].rename(
-                columns={"chg_pct": "chg %", "high_52w": "52w high"})
+                columns={"chg_pct": "chg %", "high_w": f"{hl_label} high"})
             show_table(t, hide_index=True, use_container_width=True, height=300)
-            download_button(t, f"new_highs_{as_of_scan}.csv", "dl_highs")
+            download_button(t, f"highs_{hl_days}d_{as_of_scan}.csv", "dl_highs")
         with lc:
-            st.caption(f"{len(lows)} at a 52-week low")
-            cols = [c for c in ["symbol", "sector", "close", "chg_pct", "low_52w"]
+            st.caption(f"{len(lows)} at a {hl_label} low")
+            cols = [c for c in ["symbol", "sector", "close", "chg_pct", "low_w"]
                     if c in lows.columns]
             t = lows.sort_values("chg_pct")[cols].rename(
-                columns={"chg_pct": "chg %", "low_52w": "52w low"})
+                columns={"chg_pct": "chg %", "low_w": f"{hl_label} low"})
             show_table(t, hide_index=True, use_container_width=True, height=300)
-            download_button(t, f"new_lows_{as_of_scan}.csv", "dl_lows")
+            download_button(t, f"lows_{hl_days}d_{as_of_scan}.csv", "dl_lows")
 
-    st.markdown("### Volume spikes")
-    try:
-        vol_avg = load_volume_average(as_of_scan, 20)
-        vs = base.merge(vol_avg, on="symbol", how="left")
-        vs = vs[vs["avg_volume"].fillna(0) > 0]
+    # ---- biggest movers over the period ----
+    st.markdown(f"### Biggest movers over {period_label.lower()}")
+    if period_ret_col not in base.columns:
+        st.info(f"No {period_label} return data stored yet.")
+    else:
+        movers = base.dropna(subset=[period_ret_col])
+        move_min = st.slider("Minimum move (%)", 1.0, 100.0, 10.0, 1.0,
+                             key="scan_move")
+        big = movers[movers[period_ret_col].abs() >= move_min]
+        big = big.reindex(big[period_ret_col].abs().sort_values(
+            ascending=False).index)
+        st.caption(f"{len(big)} stocks moved at least {move_min:g}% over "
+                   f"{period_label.lower()}")
+        cols = [c for c in ["symbol", "sector", "cap_category", "close",
+                            period_ret_col] if c in big.columns]
+        t = big[cols].rename(columns={period_ret_col: f"{period_label} %",
+                                      "cap_category": "cap"})
+        show_table(t, hide_index=True, use_container_width=True, height=340)
+        download_button(t, f"movers_{period_days}d_{as_of_scan}.csv", "dl_movers")
+
+    # ---- volume against the period average ----
+    st.markdown(f"### Volume vs the {hl_label} average")
+    if stats is None or "avg_volume" not in base.columns:
+        st.info("Not available.")
+    else:
+        vs = base[base["avg_volume"].fillna(0) > 0].copy()
         vs["volume x avg"] = (vs["volume"] / vs["avg_volume"]).round(2)
-        threshold = st.slider("Minimum multiple of 20-day average volume",
+        threshold = st.slider("Minimum multiple of average volume",
                               1.5, 10.0, 3.0, 0.5, key="scan_vol_mult")
         spikes = vs[vs["volume x avg"] >= threshold].sort_values(
             "volume x avg", ascending=False)
-        st.caption(f"{len(spikes)} stocks traded at least {threshold:g}x "
-                   f"their 20-day average volume")
+        st.caption(f"{len(spikes)} stocks traded at least {threshold:g}x their "
+                   f"{hl_label} average volume")
         cols = [c for c in ["symbol", "sector", "close", "chg_pct",
                             "volume", "avg_volume", "volume x avg"]
                 if c in spikes.columns]
-        t = spikes[cols].rename(columns={"chg_pct": "chg %", "avg_volume": "20d avg vol"})
+        t = spikes[cols].rename(columns={"chg_pct": "chg %",
+                                         "avg_volume": f"{hl_label} avg vol"})
         show_table(t, hide_index=True, use_container_width=True, height=340)
-        download_button(t, f"volume_spikes_{as_of_scan}.csv", "dl_vol")
-    except Exception as exc:
-        st.warning(f"Volume scanner unavailable: {exc}")
+        download_button(t, f"volume_{hl_days}d_{as_of_scan}.csv", "dl_vol")
 
+    # ---- gaps: a single-session idea, so always the latest day ----
     st.markdown("### Gap ups and gap downs")
+    st.caption("A gap is the jump from one close to the next open, so this one "
+               "is always the latest session regardless of the period above.")
     gaps = base.dropna(subset=["open", "prev_close"]).copy()
     gaps = gaps[gaps["prev_close"] > 0]
     gaps["gap %"] = ((gaps["open"] - gaps["prev_close"]) / gaps["prev_close"] * 100).round(2)

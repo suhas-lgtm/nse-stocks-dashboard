@@ -75,6 +75,11 @@ def fake_read_sql(sql, con, params=None):
         return pd.DataFrame([
             {"date": d, "index": ix, "close": 20000 + i * 3, "chg_pct": 0.4}
             for i, d in enumerate(DATES[-30:]) for ix in ("NIFTY 50", "NIFTY BANK")])
+    if "AVG(volume)" in q and "MAX(high)" in q:
+        return pd.DataFrame({"symbol": SYMS,
+                             "high_w": np.random.uniform(2000, 4000, len(SYMS)),
+                             "low_w": np.random.uniform(5, 50, len(SYMS)),
+                             "avg_volume": np.random.uniform(1e4, 1e6, len(SYMS))})
     if "MAX(high)" in q:
         return pd.DataFrame({"symbol": SYMS,
                              "high_52w": np.random.uniform(2000, 4000, len(SYMS)),
