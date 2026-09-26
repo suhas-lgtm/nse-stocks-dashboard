@@ -259,10 +259,16 @@ def load_closes_on(date_strs: tuple[str, ...]) -> pd.DataFrame:
     """
     if not date_strs:
         return pd.DataFrame()
+    # One named bind per date rather than "= ANY(:ds)": psycopg2 renders a
+    # Python list of str as a *text* array, so that form asks Postgres for a
+    # "date = text" operator and fails with UndefinedFunction. Individual
+    # binds arrive untyped and compare to a date column cleanly.
+    names = [f"d{i}" for i in range(len(date_strs))]
+    placeholders = ", ".join(f":{n}" for n in names)
     df = pd.read_sql(
-        text("""SELECT date::text AS date, symbol, close
-                FROM daily_prices WHERE date = ANY(:ds)"""),
-        get_db(), params={"ds": list(date_strs)},
+        text(f"""SELECT date::text AS date, symbol, close
+                 FROM daily_prices WHERE date IN ({placeholders})"""),
+        get_db(), params=dict(zip(names, date_strs)),
     )
     return df.pivot_table(index="symbol", columns="date", values="close")
 
@@ -279,7 +285,8 @@ def load_52w(as_of: str) -> pd.DataFrame:
                        MAX(high) AS high_52w,
                        MIN(low)  AS low_52w
                 FROM daily_prices
-                WHERE date <= :d AND date > (:d::date - INTERVAL '1 year')
+                WHERE date <= CAST(:d AS date)
+                  AND date >  CAST(:d AS date) - INTERVAL '1 year'
                 GROUP BY symbol"""),
         get_db(), params={"d": as_of},
     )
@@ -524,9 +531,16 @@ with tab_stocks:
     df = load_day(selected_date_str)
     df = with_market_cap(df, shares_df)
     df = with_sector(df, sectors_df)
+    # The history-derived columns are extras: every downstream use of them is
+    # already conditional on the column existing, so a failure here should cost
+    # those columns, not the whole page. Streamlit runs the script top to
+    # bottom, so an uncaught error in this tab blanks all four of them.
     as_of_for_history = df["date"].iloc[0] if not df.empty else selected_date_str
-    df = with_period_returns(df, as_of_for_history, dates)
-    df = with_52w(df, as_of_for_history)
+    try:
+        df = with_period_returns(df, as_of_for_history, dates)
+        df = with_52w(df, as_of_for_history)
+    except Exception as exc:
+        st.warning(f"Period-return and 52-week columns unavailable: {exc}")
     as_of = df["date"].iloc[0] if not df.empty else selected_date_str
     st.caption(f"Data as of {as_of} · Source: Yahoo Finance · {len(df):,} securities")
 
@@ -554,8 +568,10 @@ with tab_stocks:
         "Max market cap (₹cr)", min_value=0.0, value=None, step=1000.0,
         placeholder="no maximum", key="stocks_mc_max",
     )
-    near_high = st.checkbox(
-        "Only stocks within 5% of their 52-week high", value=False, key="stocks_near_high"
+    near_high = (
+        st.checkbox("Only stocks within 5% of their 52-week high",
+                    value=False, key="stocks_near_high")
+        if "off_high_pct" in df.columns else False
     )
     search = st.text_input("Search symbol or name", "", key="stocks_search")
 
@@ -574,7 +590,7 @@ with tab_stocks:
         filtered = filtered[filtered["market_cap_cr"] >= mc_min]
     if mc_max is not None:
         filtered = filtered[filtered["market_cap_cr"] <= mc_max]
-    if near_high:
+    if near_high and "off_high_pct" in filtered.columns:
         filtered = filtered[filtered["off_high_pct"] >= -5]
     if mc_min is not None or mc_max is not None:
         lo = f"₹{mc_min:,.0f}cr" if mc_min is not None else "any"
