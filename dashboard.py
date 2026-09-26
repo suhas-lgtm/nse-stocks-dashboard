@@ -5,7 +5,7 @@ Layout/design will be revisited later; this just needs to show the data clearly.
 
 import hashlib
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -154,6 +154,45 @@ def load_shares() -> pd.DataFrame:
     )
 
 
+# Lookback windows for the multi-period return columns, in calendar days.
+RETURN_PERIODS = [("1W", 7), ("1M", 30), ("3M", 91), ("6M", 182), ("1Y", 365)]
+
+
+@st.cache_data(ttl=600)
+def load_closes_on(date_strs: tuple[str, ...]) -> pd.DataFrame:
+    """Closing prices for a handful of specific dates, as symbol x date.
+
+    One query for all the reference dates rather than one per period — the
+    dates are a tiny IN list and daily_prices is indexed on date.
+    """
+    if not date_strs:
+        return pd.DataFrame()
+    df = pd.read_sql(
+        text("""SELECT date::text AS date, symbol, close
+                FROM daily_prices WHERE date = ANY(:ds)"""),
+        get_db(), params={"ds": list(date_strs)},
+    )
+    return df.pivot_table(index="symbol", columns="date", values="close")
+
+
+@st.cache_data(ttl=600)
+def load_52w(as_of: str) -> pd.DataFrame:
+    """52-week high/low per symbol, over the year ending on as_of.
+
+    Uses the stored intraday high/low rather than closes, which is what a
+    "52-week high" conventionally means.
+    """
+    return pd.read_sql(
+        text("""SELECT symbol,
+                       MAX(high) AS high_52w,
+                       MIN(low)  AS low_52w
+                FROM daily_prices
+                WHERE date <= :d AND date > (:d::date - INTERVAL '1 year')
+                GROUP BY symbol"""),
+        get_db(), params={"d": as_of},
+    )
+
+
 @st.cache_data(ttl=600)
 def load_sectors() -> pd.DataFrame:
     """Sector per symbol. Returns an empty frame if the table isn't there yet,
@@ -186,12 +225,28 @@ def watchlist_symbols(list_type: str) -> list[str]:
     return [r[0] for r in rows]
 
 
-def watchlist_add(list_type: str, symbol: str) -> None:
+def watchlist_holdings(list_type: str) -> dict:
+    """{symbol: {"quantity": x, "buy_price": y}} in the order stocks were added.
+    Either field may be None — a name can be watched without being held."""
+    with get_db().connect() as conn:
+        rows = conn.execute(
+            text("""SELECT symbol, quantity, buy_price FROM watchlist
+                    WHERE list_type = :t ORDER BY added_at"""),
+            {"t": list_type},
+        ).fetchall()
+    return {r[0]: {"quantity": r[1], "buy_price": r[2]} for r in rows}
+
+
+def watchlist_add(list_type: str, symbol: str,
+                  quantity=None, buy_price=None) -> None:
     with get_db().begin() as conn:
         conn.execute(
-            text("""INSERT INTO watchlist (list_type, symbol) VALUES (:t, :s)
-                    ON CONFLICT (list_type, symbol) DO NOTHING"""),
-            {"t": list_type, "s": symbol},
+            text("""INSERT INTO watchlist (list_type, symbol, quantity, buy_price)
+                    VALUES (:t, :s, :q, :p)
+                    ON CONFLICT (list_type, symbol) DO UPDATE SET
+                        quantity = EXCLUDED.quantity,
+                        buy_price = EXCLUDED.buy_price"""),
+            {"t": list_type, "s": symbol, "q": quantity, "p": buy_price},
         )
 
 
@@ -228,6 +283,39 @@ def with_market_cap(df: pd.DataFrame, shares_df: pd.DataFrame) -> pd.DataFrame:
     merged = df.merge(shares_df, on="symbol", how="left")
     merged["market_cap_cr"] = (merged["shares_outstanding"] * merged["close"] / 1e7).round(1)
     merged["cap_category"] = merged["market_cap_cr"].apply(cap_category)
+    return merged
+
+
+def with_period_returns(df: pd.DataFrame, as_of: str, all_dates: list[str]) -> pd.DataFrame:
+    """Adds ret_1W ... ret_1Y, each vs the nearest trading day on or before
+    (as_of - period). Periods with no history that far back come out NaN."""
+    as_of_date = datetime.strptime(as_of, "%Y-%m-%d").date()
+    earliest = all_dates[0]
+
+    ref: dict[str, str] = {}
+    for label, days in RETURN_PERIODS:
+        target = (as_of_date - timedelta(days=days)).isoformat()
+        if target < earliest:
+            continue  # not enough history stored for this window
+        ref[label] = nearest_available(all_dates, target)
+
+    closes = load_closes_on(tuple(sorted(set(ref.values()))))
+    out = df.copy()
+    for label, ref_date in ref.items():
+        if closes.empty or ref_date not in closes.columns:
+            continue
+        base = out["symbol"].map(closes[ref_date])
+        out[f"ret_{label}"] = ((out["close"] - base) / base * 100).round(2)
+    return out
+
+
+def with_52w(df: pd.DataFrame, as_of: str) -> pd.DataFrame:
+    """Adds high_52w, low_52w and off_high_pct (how far below the 52w high,
+    as a negative number; 0 means sitting at the high)."""
+    merged = df.merge(load_52w(as_of), on="symbol", how="left")
+    merged["off_high_pct"] = (
+        (merged["close"] - merged["high_52w"]) / merged["high_52w"] * 100
+    ).round(2)
     return merged
 
 
@@ -328,6 +416,9 @@ with tab_stocks:
     df = load_day(selected_date_str)
     df = with_market_cap(df, shares_df)
     df = with_sector(df, sectors_df)
+    as_of_for_history = df["date"].iloc[0] if not df.empty else selected_date_str
+    df = with_period_returns(df, as_of_for_history, dates)
+    df = with_52w(df, as_of_for_history)
     as_of = df["date"].iloc[0] if not df.empty else selected_date_str
     st.caption(f"Data as of {as_of} · Source: Yahoo Finance · {len(df):,} securities")
 
@@ -355,6 +446,9 @@ with tab_stocks:
         "Max market cap (₹cr)", min_value=0.0, value=None, step=1000.0,
         placeholder="no maximum", key="stocks_mc_max",
     )
+    near_high = st.checkbox(
+        "Only stocks within 5% of their 52-week high", value=False, key="stocks_near_high"
+    )
     search = st.text_input("Search symbol or name", "", key="stocks_search")
 
     filtered = df[
@@ -372,6 +466,8 @@ with tab_stocks:
         filtered = filtered[filtered["market_cap_cr"] >= mc_min]
     if mc_max is not None:
         filtered = filtered[filtered["market_cap_cr"] <= mc_max]
+    if near_high:
+        filtered = filtered[filtered["off_high_pct"] >= -5]
     if mc_min is not None or mc_max is not None:
         lo = f"₹{mc_min:,.0f}cr" if mc_min is not None else "any"
         hi = f"₹{mc_max:,.0f}cr" if mc_max is not None else "any"
@@ -387,17 +483,28 @@ with tab_stocks:
         filtered = filtered[mask]
 
     sort_col = st.selectbox(
-        "Sort by", ["chg_pct", "symbol", "close", "market_cap_cr"], index=0, key="stocks_sort"
+        "Sort by",
+        [c for c in ["chg_pct", "symbol", "close", "market_cap_cr",
+                     "ret_1W", "ret_1M", "ret_3M", "ret_6M", "ret_1Y", "off_high_pct"]
+         if c in filtered.columns],
+        index=0, key="stocks_sort"
     )
     sort_desc = st.checkbox("Descending", value=True, key="stocks_sort_desc")
     filtered = filtered.sort_values(sort_col, ascending=not sort_desc)
 
     st.dataframe(
-        filtered[["symbol", "name", "series", "sector", "cap_category", "market_cap_cr",
-                  "close", "prev_close", "chg_pct"]]
+        filtered[[c for c in
+                  ["symbol", "name", "series", "sector", "cap_category", "market_cap_cr",
+                   "close", "prev_close", "chg_pct",
+                   "ret_1W", "ret_1M", "ret_3M", "ret_6M", "ret_1Y",
+                   "high_52w", "low_52w", "off_high_pct"]
+                  if c in filtered.columns]]
         .rename(columns={
             "cap_category": "cap", "market_cap_cr": "mkt cap (₹cr)",
             "close": "current price", "prev_close": "previous close", "chg_pct": "chg %",
+            "ret_1W": "1W %", "ret_1M": "1M %", "ret_3M": "3M %",
+            "ret_6M": "6M %", "ret_1Y": "1Y %",
+            "high_52w": "52w high", "low_52w": "52w low", "off_high_pct": "off high %",
         }),
         use_container_width=True, hide_index=True, height=600,
     )
@@ -583,26 +690,53 @@ with tab_watchlist:
     symbol_lookup = today_df.set_index("symbol")[["name", "series"]].to_dict("index")
     symbol_options = sorted(f"{s} — {info['name']}" for s, info in symbol_lookup.items())
 
-    def _watchlist_table(symbols: list[str]) -> pd.DataFrame:
+    def _watchlist_table(holdings: dict) -> pd.DataFrame:
+        symbols = list(holdings)
         rows = today_df[today_df["symbol"].isin(symbols)].copy()
         # Keep watchlist order rather than whatever order the merge produced.
         rows["_order"] = rows["symbol"].apply(symbols.index)
         rows = rows.sort_values("_order").drop(columns="_order")
-        return rows[["symbol", "name", "sector", "cap_category", "market_cap_cr", "close", "chg_pct"]]
+        cols = ["symbol", "name", "sector", "cap_category", "market_cap_cr",
+                "close", "chg_pct"]
+        rows = rows[cols]
+
+        qty = rows["symbol"].map(lambda s: holdings[s].get("quantity"))
+        buy = rows["symbol"].map(lambda s: holdings[s].get("buy_price"))
+        # Only show the portfolio columns once at least one holding is entered,
+        # so a plain watchlist stays a plain watchlist.
+        if qty.notna().any():
+            rows["qty"] = qty
+            rows["buy price"] = buy
+            rows["invested"] = (qty * buy).round(2)
+            rows["value"] = (qty * rows["close"]).round(2)
+            rows["P&L"] = (rows["value"] - rows["invested"]).round(2)
+            rows["P&L %"] = ((rows["value"] / rows["invested"] - 1) * 100).round(2)
+            total_value = rows["value"].sum()
+            if total_value:
+                rows["weight %"] = (rows["value"] / total_value * 100).round(2)
+        return rows
 
     # Personal list lives in the database (survives restarts, same on every
     # device). Common list stays per-visitor and temporary, as specified.
-    def _get_symbols(state_key: str, persistent: bool) -> list[str]:
+    def _get_holdings(state_key: str, persistent: bool) -> dict:
         if persistent:
-            return watchlist_symbols(state_key)
-        return st.session_state.setdefault(state_key, [])
+            return watchlist_holdings(state_key)
+        current = st.session_state.setdefault(state_key, {})
+        if isinstance(current, list):  # older session shape
+            current = {sym: {"quantity": None, "buy_price": None} for sym in current}
+            st.session_state[state_key] = current
+        return current
+
+    def _get_symbols(state_key: str, persistent: bool) -> list[str]:
+        return list(_get_holdings(state_key, persistent))
 
     def _render_watchlist(state_key: str, key_prefix: str, persistent: bool):
-        symbols = _get_symbols(state_key, persistent)
+        holdings = _get_holdings(state_key, persistent)
+        symbols = list(holdings)
         if not symbols:
             st.caption("Empty — add a stock below.")
             return
-        table = _watchlist_table(symbols)
+        table = _watchlist_table(holdings)
         opts = sector_options(table)
         if len(opts) > 1:
             chosen_sectors = st.multiselect(
@@ -619,6 +753,36 @@ with tab_watchlist:
                          .round(2).sort_values("avg chg %", ascending=False))
             st.caption("By sector")
             st.dataframe(by_sector, use_container_width=True)
+
+        if "value" in table.columns and table["value"].notna().any():
+            invested = table["invested"].sum()
+            value = table["value"].sum()
+            pnl = value - invested
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Invested", f"₹{invested:,.0f}")
+            m2.metric("Current value", f"₹{value:,.0f}")
+            m3.metric("P&L", f"₹{pnl:,.0f}",
+                      f"{(value / invested - 1) * 100:.2f}%" if invested else None)
+
+        with st.expander("Set quantity / buy price"):
+            edit_sym = st.selectbox("Stock", symbols, key=f"{key_prefix}_hold_sym")
+            cur = holdings.get(edit_sym, {})
+            e1, e2 = st.columns(2)
+            new_qty = e1.number_input(
+                "Quantity", min_value=0.0, value=cur.get("quantity"),
+                step=1.0, placeholder="not held", key=f"{key_prefix}_hold_qty",
+            )
+            new_price = e2.number_input(
+                "Buy price (₹)", min_value=0.0, value=cur.get("buy_price"),
+                step=1.0, placeholder="not set", key=f"{key_prefix}_hold_price",
+            )
+            if st.button("Save holding", key=f"{key_prefix}_hold_save"):
+                if persistent:
+                    watchlist_add(state_key, edit_sym, new_qty, new_price)
+                else:
+                    holdings[edit_sym] = {"quantity": new_qty, "buy_price": new_price}
+                st.rerun()
+
         remove_sym = st.selectbox(
             "Remove a stock", ["—"] + symbols, key=f"{key_prefix}_remove_select"
         )
@@ -626,7 +790,7 @@ with tab_watchlist:
             if persistent:
                 watchlist_remove(state_key, remove_sym)
             else:
-                st.session_state[state_key] = [s for s in symbols if s != remove_sym]
+                holdings.pop(remove_sym, None)
             st.rerun()
 
     def _add_stock_ui(state_key: str, key_prefix: str, persistent: bool):
@@ -638,9 +802,8 @@ with tab_watchlist:
             if persistent:
                 watchlist_add(state_key, symbol)
             else:
-                symbols = st.session_state.setdefault(state_key, [])
-                if symbol not in symbols:
-                    symbols.append(symbol)
+                holdings = _get_holdings(state_key, persistent)
+                holdings.setdefault(symbol, {"quantity": None, "buy_price": None})
             st.rerun()
 
     def _watchlist_returns_calculator(state_key: str, key_prefix: str, persistent: bool):

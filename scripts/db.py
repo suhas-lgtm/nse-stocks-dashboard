@@ -57,6 +57,11 @@ SCHEMA_STATEMENTS = [
         PRIMARY KEY (list_type, symbol)
     )
     """,
+    # Optional holding size per watchlist entry, so the watchlist can show
+    # position value and P&L rather than just a list of names. ADD COLUMN IF
+    # NOT EXISTS keeps this idempotent against the already-populated table.
+    "ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS quantity DOUBLE PRECISION",
+    "ALTER TABLE watchlist ADD COLUMN IF NOT EXISTS buy_price DOUBLE PRECISION",
     # NSE's own sector classification, keyed by symbol. Kept in its own table
     # rather than a column on daily_prices: it changes a few times a year, not
     # daily, so repeating it on every one of ~645k price rows would be waste.
