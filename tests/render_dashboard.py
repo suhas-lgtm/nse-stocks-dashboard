@@ -72,9 +72,20 @@ def fake_read_sql(sql, con, params=None):
         return pd.DataFrame({"symbol": SYMS,
                              "sector": [random.choice(SECTORS) for _ in SYMS]})
     if "FROM indices_history" in q:
-        return pd.DataFrame([
-            {"date": d, "index": ix, "close": 20000 + i * 3, "chg_pct": 0.4}
-            for i, d in enumerate(DATES[-30:]) for ix in ("NIFTY 50", "NIFTY BANK")])
+        idx = ["NIFTY 50", "NIFTY BANK"]
+        if "COUNT(*)" in q:
+            return pd.DataFrame({"index": idx, "days_of_history": [30, 30]})
+        if "WHERE index_name = :n" in q:
+            return pd.DataFrame({"date": DATES[-30:],
+                                 "close": np.random.uniform(19000, 21000, 30)})
+        if "DISTINCT ON (index_name)" in q and "WITH" not in q:
+            return pd.DataFrame({"index": idx, "date": [DATES[-1]] * 2,
+                                 "close": [20100.0, 46000.0],
+                                 "chg_pct": [0.4, -0.2]})
+        # closes-between (the WITH f/t query)
+        return pd.DataFrame({"index": idx,
+                             "from_date": [DATES[-30]] * 2, "close_from": [19800.0, 45000.0],
+                             "to_date": [DATES[-1]] * 2, "close_to": [20100.0, 46000.0]})
     if "AVG(volume)" in q and "MAX(high)" in q:
         return pd.DataFrame({"symbol": SYMS,
                              "high_w": np.random.uniform(2000, 4000, len(SYMS)),

@@ -66,9 +66,32 @@ def main() -> int:
                       close, prev_close, chg_pct, volume
                FROM daily_prices WHERE date = :d""", d=as_of))) + " rows")
 
-        check("load_indices", lambda: str(len(rows(
-            """SELECT date::text AS date, index_name AS index, close, chg_pct
-               FROM indices_history ORDER BY index_name, date"""))) + " rows")
+        check("load_indices_latest", lambda: str(len(rows(
+            """SELECT DISTINCT ON (index_name)
+                      index_name AS index, date::text AS date, close, chg_pct
+               FROM indices_history ORDER BY index_name, date DESC"""))) + " indices")
+
+        check("load_index_history_counts", lambda: str(len(rows(
+            """SELECT index_name AS index, COUNT(*) AS days_of_history
+               FROM indices_history GROUP BY index_name"""))) + " indices")
+
+        check("load_index_series", lambda: str(len(rows(
+            """SELECT date::text AS date, close FROM indices_history
+               WHERE index_name = :n ORDER BY date""", n="NIFTY 50"))) + " bars")
+
+        check("load_index_closes_between", lambda: str(len(rows(
+            """WITH f AS (
+                   SELECT DISTINCT ON (index_name) index_name, date::text AS d, close
+                   FROM indices_history WHERE date <= CAST(:f AS date)
+                   ORDER BY index_name, date DESC
+               ), t AS (
+                   SELECT DISTINCT ON (index_name) index_name, date::text AS d, close
+                   FROM indices_history WHERE date <= CAST(:t AS date)
+                   ORDER BY index_name, date DESC
+               )
+               SELECT f.index_name, f.d, f.close, t.d, t.close
+               FROM f JOIN t USING (index_name)""",
+            f="2026-01-01", t=as_of))) + " indices")
 
         check("load_shares", lambda: str(len(rows(
             "SELECT symbol, shares_outstanding FROM shares_outstanding"))) + " rows")

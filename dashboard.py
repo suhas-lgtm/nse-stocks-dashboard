@@ -250,17 +250,70 @@ def load_day(date_str: str) -> pd.DataFrame:
     )
 
 
+# Every index level ever stored is a few thousand rows, and the page used to
+# pull all of them on every cache miss just to show ten tiles. These four
+# queries return only what each view needs.
 @st.cache_data(ttl=600)
-def load_indices() -> pd.DataFrame:
-    df = pd.read_sql(
-        text("""SELECT date::text AS date, index_name AS index, close, chg_pct
-                FROM indices_history ORDER BY index_name, date"""),
+def load_indices_latest() -> pd.DataFrame:
+    """Latest level and day change per index, plus how many days each has."""
+    return pd.read_sql(
+        text("""SELECT DISTINCT ON (index_name)
+                       index_name AS index, date::text AS date, close, chg_pct
+                FROM indices_history
+                ORDER BY index_name, date DESC"""),
         get_db(),
     )
-    return df
 
 
 @st.cache_data(ttl=600)
+def load_index_history_counts() -> pd.DataFrame:
+    """Days of stored history per index, counted in SQL rather than by pulling
+    every row and counting them here."""
+    return pd.read_sql(
+        text("""SELECT index_name AS index, COUNT(*) AS days_of_history
+                FROM indices_history GROUP BY index_name"""),
+        get_db(),
+    )
+
+
+@st.cache_data(ttl=600)
+def load_index_series(index_name: str) -> pd.DataFrame:
+    """One index's full series — only fetched when a chart asks for it."""
+    return pd.read_sql(
+        text("""SELECT date::text AS date, close FROM indices_history
+                WHERE index_name = :n ORDER BY date"""),
+        get_db(), params={"n": index_name},
+    )
+
+
+@st.cache_data(ttl=600)
+def load_index_closes_between(from_date: str, to_date: str) -> pd.DataFrame:
+    """Each index's first close on or before each of the two dates.
+
+    DISTINCT ON does the "nearest earlier trading day" lookup in SQL, so this
+    returns two rows per index instead of the whole history.
+    """
+    return pd.read_sql(
+        text("""
+            WITH f AS (
+                SELECT DISTINCT ON (index_name) index_name, date::text AS d, close
+                FROM indices_history WHERE date <= CAST(:f AS date)
+                ORDER BY index_name, date DESC
+            ), t AS (
+                SELECT DISTINCT ON (index_name) index_name, date::text AS d, close
+                FROM indices_history WHERE date <= CAST(:t AS date)
+                ORDER BY index_name, date DESC
+            )
+            SELECT f.index_name AS index,
+                   f.d AS from_date, f.close AS close_from,
+                   t.d AS to_date,   t.close AS close_to
+            FROM f JOIN t USING (index_name)
+        """),
+        get_db(), params={"f": from_date, "t": to_date},
+    )
+
+
+@st.cache_data(ttl=86400)  # refreshed monthly by the workflow
 def load_shares() -> pd.DataFrame:
     return pd.read_sql(
         text("SELECT symbol, shares_outstanding FROM shares_outstanding"), get_db()
@@ -356,7 +409,7 @@ def load_window_stats(as_of: str, days: int) -> pd.DataFrame:
     )
 
 
-@st.cache_data(ttl=600)
+@st.cache_data(ttl=86400)  # refreshed monthly by the workflow
 def load_sectors() -> pd.DataFrame:
     """Sector per symbol. Returns an empty frame if the table isn't there yet,
     so a deploy that lands before the first sector fetch degrades to showing
@@ -618,10 +671,10 @@ shares_df = load_shares()
 sectors_df = load_sectors()
 
 # ---- Popular index strip (always visible) ----
-indices_df = load_indices()
-if not indices_df.empty:
-    latest_idx_date = indices_df["date"].max()
-    today_idx = indices_df[indices_df["date"] == latest_idx_date].set_index("index")
+indices_latest = load_indices_latest()
+if not indices_latest.empty:
+    latest_idx_date = indices_latest["date"].max()
+    today_idx = indices_latest.set_index("index")
     shown = [name for name in POPULAR_INDICES if name in today_idx.index]
 
     tiles_html = []
@@ -1172,13 +1225,13 @@ with tab_returns:
 
 # ==================================================== Tab 3: All Indices
 with tab_indices:
-    if indices_df.empty:
+    if indices_latest.empty:
         st.info("No index data yet. Run `python scripts/fetch_indices.py`.")
     else:
         st.caption("Every Indian market index found on Yahoo Finance (checked manually — yfinance has no index-listing API).")
-        latest_idx_date = indices_df["date"].max()
-        hist_counts = indices_df.groupby("index")["date"].nunique()
-        summary = indices_df[indices_df["date"] == latest_idx_date].copy()
+        latest_idx_date = indices_latest["date"].max()
+        hist_counts = load_index_history_counts().set_index("index")["days_of_history"]
+        summary = indices_latest.copy()
         summary["days_of_history"] = summary["index"].map(hist_counts)
         summary["has_history"] = summary["days_of_history"] > 1
         summary = summary.sort_values("index")
@@ -1203,32 +1256,33 @@ with tab_indices:
         if idx_from > idx_to:
             st.error("'From' date must be on or before 'To' date.")
         else:
-            idx_rows = []
-            for name in idx_with_history:
-                sub = indices_df[indices_df["index"] == name].sort_values("date")
-                idx_dates = sub["date"].tolist()
-                f_str = nearest_available(idx_dates, idx_from.strftime("%Y-%m-%d"))
-                t_str = nearest_available(idx_dates, idx_to.strftime("%Y-%m-%d"))
-                start_close = sub.loc[sub["date"] == f_str, "close"].iloc[0]
-                end_close = sub.loc[sub["date"] == t_str, "close"].iloc[0]
-                idx_rows.append({
-                    "index": name,
-                    "close_from": start_close,
-                    "close_to": end_close,
-                    "return_pct": round((end_close - start_close) / start_close * 100, 2),
-                    "from_date": f_str, "to_date": t_str,
-                })
-            idx_ret_df = pd.DataFrame(idx_rows).sort_values("return_pct", ascending=False)
-            st.dataframe(
-                idx_ret_df[["index", "close_from", "close_to", "return_pct", "from_date", "to_date"]],
-                use_container_width=True, hide_index=True, height=450,
-            )
+            idx_ret_df = load_index_closes_between(
+                idx_from.strftime("%Y-%m-%d"), idx_to.strftime("%Y-%m-%d"))
+            idx_ret_df = idx_ret_df[idx_ret_df["index"].isin(idx_with_history)]
+            if idx_ret_df.empty:
+                st.caption("No index has data on both dates.")
+            else:
+                idx_ret_df = idx_ret_df[idx_ret_df["close_from"] > 0].copy()
+                idx_ret_df["return_pct"] = (
+                    (idx_ret_df["close_to"] - idx_ret_df["close_from"])
+                    / idx_ret_df["close_from"] * 100).round(2)
+                idx_ret_df = idx_ret_df.sort_values("return_pct", ascending=False)
+                show_table(
+                    idx_ret_df[["index", "close_from", "close_to", "return_pct",
+                                "from_date", "to_date"]]
+                    .rename(columns={"return_pct": "return %"}),
+                    use_container_width=True, hide_index=True, height=450,
+                )
 
         st.divider()
         st.subheader("Chart a single index")
         chosen = st.selectbox("Index", idx_with_history, key="idx_choice")
-        sub = indices_df[indices_df["index"] == chosen].sort_values("date")
-        st.line_chart(sub.set_index("date")["close"])
+        if chosen:
+            series = load_index_series(chosen)
+            if series.empty:
+                st.caption("No stored history for this index.")
+            else:
+                st.line_chart(series.set_index("date")["close"])
 
 # ==================================================== Tab 4: Watchlist
 with tab_watchlist:
