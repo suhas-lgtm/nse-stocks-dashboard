@@ -54,12 +54,12 @@ monthly) because the price fetch reads it to know which symbols to pull.
 scripts/db.py                        # engine, schema, and the batched upsert helper
 scripts/migrate_csv_to_db.py         # one-time: loaded the existing CSVs into Postgres
 scripts/refresh_symbol_master.py     # monthly: rebuilds data/symbol_master.csv from NSE
-scripts/fetch_yahoo_prices.py        # 4pm + 11pm: pulls prices from Yahoo -> daily_prices
-scripts/fetch_indices.py             # 4pm + 11pm: pulls 26 Indian indices -> indices_history
+scripts/fetch_yahoo_prices.py        # 11pm IST: pulls prices from Yahoo -> daily_prices
+scripts/fetch_indices.py             # 11pm IST: pulls 26 Indian indices -> indices_history
 scripts/fetch_shares_outstanding.py  # monthly: share counts -> shares_outstanding
 scripts/backfill_history.py          # one-time: ~1y of history for every stock
 dashboard.py                         # Streamlit app: Stocks / Returns / All Indices / Watchlist
-.github/workflows/nightly_fetch.yml           # 4pm + 11pm IST price + index refresh
+.github/workflows/nightly_fetch.yml           # 11pm IST price + index refresh
 .github/workflows/monthly_symbol_refresh.yml  # monthly symbol list + share counts
 ```
 
