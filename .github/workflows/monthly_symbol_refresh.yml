@@ -43,6 +43,16 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/fetch_shares_outstanding.py
 
+      # Fund houses publish portfolios monthly, so this runs on the same
+      # cadence. Skipped when ADVISORKHOJ_KEY isn't set, so a fork or a repo
+      # without the key still gets a green run.
+      - name: Refresh mutual fund holdings from Advisorkhoj
+        if: ${{ secrets.ADVISORKHOJ_KEY != '' }}
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          ADVISORKHOJ_KEY: ${{ secrets.ADVISORKHOJ_KEY }}
+        run: python scripts/fetch_mf_holdings.py --months 6
+
       - name: Commit symbol master if changed
         run: |
           git config user.name "github-actions[bot]"

@@ -71,6 +71,38 @@ SCHEMA_STATEMENTS = [
         sector  TEXT
     )
     """,
+    # Mutual fund equity holdings from Advisorkhoj, one row per
+    # (month, scheme, stock). Normalised hard because this is the largest
+    # table after daily_prices: the scheme name and the instrument name would
+    # otherwise repeat across every one of ~400k rows.
+    """
+    CREATE TABLE IF NOT EXISTS mf_schemes (
+        scheme_id  SERIAL PRIMARY KEY,
+        scheme     TEXT UNIQUE NOT NULL,
+        category   TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS mf_instruments (
+        isin        TEXT PRIMARY KEY,
+        instrument  TEXT,
+        sector      TEXT,
+        industry    TEXT
+    )
+    """,
+    """
+    CREATE TABLE IF NOT EXISTS mf_holdings (
+        portfolio_date  DATE   NOT NULL,
+        scheme_id       INTEGER NOT NULL,
+        isin            TEXT   NOT NULL,
+        value_lakh      DOUBLE PRECISION,
+        holdings_pct    DOUBLE PRECISION,
+        PRIMARY KEY (portfolio_date, scheme_id, isin)
+    )
+    """,
+    # The stock-level views group by isin across schemes, which the PK
+    # (leading with date) cannot serve.
+    "CREATE INDEX IF NOT EXISTS idx_mf_holdings_isin ON mf_holdings (isin)",
     """
     CREATE TABLE IF NOT EXISTS meta (
         key    TEXT PRIMARY KEY,

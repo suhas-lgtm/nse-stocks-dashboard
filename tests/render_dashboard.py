@@ -111,6 +111,25 @@ def fake_read_sql(sql, con, params=None):
                                 "close": np.random.uniform(20, 3000, len(SYMS))})
                   for d in (params or {}).values()]
         return pd.concat(frames) if frames else pd.DataFrame()
+    if "FROM mf_holdings" in q and "mf_schemes" in q:
+        # schemes holding one stock
+        return pd.DataFrame({
+            "scheme": ["Alpha Flexi Cap Fund", "Beta Large Cap Fund"],
+            "category": ["Equity: Flexi Cap", "Equity: Large Cap"],
+            "value_cur": [12000.0, 8000.0],
+            "value_prev": [9000.0, 9500.0],
+            "pct_cur": [5.2, 3.1]})
+    if "FROM mf_holdings" in q:
+        # per-stock flows for two months
+        n = len(SYMS)
+        return pd.DataFrame({
+            "isin": [f"INE{i:09d}" for i in range(n)],
+            "instrument": [f"{s} LIMITED EQ" for s in SYMS],
+            "sector": [random.choice(SECTORS) for _ in SYMS],
+            "value_cur": np.random.uniform(0, 50000, n),
+            "value_prev": np.random.uniform(0, 50000, n),
+            "schemes_cur": np.random.randint(0, 60, n),
+            "schemes_prev": np.random.randint(0, 60, n)})
     if "WHERE date = :d" in q:
         return make_day(params["d"])
     raise AssertionError("unstubbed query: " + q[:140])
@@ -146,6 +165,8 @@ class FakeConn:
             return FakeResult([(d,) for d in DATES])
         if "FROM meta" in q:
             return FakeResult([("2026-09-25T17:30:00Z",)])
+        if "FROM mf_holdings" in q:
+            return FakeResult([("2026-07-31",), ("2026-08-31",)])
         if "FROM watchlist" in q and "quantity" in q:
             return FakeResult([("RELIANCE", 100.0, 1200.0), ("TCS", None, None)])
         if "SELECT symbol FROM watchlist" in q:

@@ -142,6 +142,42 @@ def main() -> int:
                       AND date >  CAST(:d AS date) - INTERVAL '{int(d)} days'
                     GROUP BY symbol""", d=as_of))) + " symbols")
 
+        # --- mutual fund holdings -------------------------------------
+        mf_month = one("SELECT max(portfolio_date)::text FROM mf_holdings")[0]
+        if not mf_month:
+            results.append((PASS, "mf_holdings", "no data yet, skipped"))
+        else:
+            check("load_mf_months", lambda: str(len(rows(
+                "SELECT DISTINCT portfolio_date::text FROM mf_holdings ORDER BY 1"
+            ))) + " months")
+
+            check("load_mf_stock_flows", lambda: str(len(rows(
+                """SELECT h.isin, i.instrument, i.sector,
+                          SUM(h.value_lakh) FILTER (WHERE h.portfolio_date = CAST(:cur AS date)) AS value_cur,
+                          SUM(h.value_lakh) FILTER (WHERE h.portfolio_date = CAST(:prev AS date)) AS value_prev,
+                          COUNT(DISTINCT h.scheme_id) FILTER (WHERE h.portfolio_date = CAST(:cur AS date)) AS schemes_cur,
+                          COUNT(DISTINCT h.scheme_id) FILTER (WHERE h.portfolio_date = CAST(:prev AS date)) AS schemes_prev
+                   FROM mf_holdings h
+                   LEFT JOIN mf_instruments i ON i.isin = h.isin
+                   WHERE h.portfolio_date IN (CAST(:cur AS date), CAST(:prev AS date))
+                   GROUP BY h.isin, i.instrument, i.sector""",
+                cur=mf_month, prev=mf_month))) + " stocks")
+
+            sample_isin = one(
+                "SELECT isin FROM mf_holdings WHERE portfolio_date = CAST(:d AS date) LIMIT 1",
+                d=mf_month)[0]
+            check("load_mf_schemes_holding", lambda: str(len(rows(
+                """SELECT s.scheme, s.category,
+                          SUM(h.value_lakh) FILTER (WHERE h.portfolio_date = CAST(:cur AS date)) AS value_cur,
+                          SUM(h.value_lakh) FILTER (WHERE h.portfolio_date = CAST(:prev AS date)) AS value_prev,
+                          MAX(h.holdings_pct) FILTER (WHERE h.portfolio_date = CAST(:cur AS date)) AS pct_cur
+                   FROM mf_holdings h
+                   JOIN mf_schemes s ON s.scheme_id = h.scheme_id
+                   WHERE h.isin = :isin
+                     AND h.portfolio_date IN (CAST(:cur AS date), CAST(:prev AS date))
+                   GROUP BY s.scheme, s.category""",
+                isin=sample_isin, cur=mf_month, prev=mf_month))) + " schemes")
+
     width = max(len(n) for _, n, _ in results)
     failures = 0
     for status, name, detail in results:

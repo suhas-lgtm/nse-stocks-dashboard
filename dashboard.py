@@ -409,6 +409,98 @@ def load_window_stats(as_of: str, days: int) -> pd.DataFrame:
     )
 
 
+# ---- Mutual fund holdings (Advisorkhoj, refreshed monthly) --------------
+@st.cache_data(ttl=86400)
+def load_mf_months() -> list[str]:
+    """Portfolio month-ends we hold, oldest first."""
+    try:
+        with get_db().connect() as conn:
+            rows = conn.execute(text(
+                "SELECT DISTINCT portfolio_date::text FROM mf_holdings ORDER BY 1"
+            )).fetchall()
+        return [r[0] for r in rows]
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=86400)
+def load_mf_stock_flows(current: str, previous: str | None) -> pd.DataFrame:
+    """Per-stock totals for one month, beside the month before it.
+
+    FILTER does both months in a single pass, so this is one query rather than
+    two plus a join in pandas.
+    """
+    sql = """
+        SELECT h.isin,
+               i.instrument, i.sector,
+               SUM(h.value_lakh) FILTER (WHERE h.portfolio_date = CAST(:cur AS date))      AS value_cur,
+               SUM(h.value_lakh) FILTER (WHERE h.portfolio_date = CAST(:prev AS date))     AS value_prev,
+               COUNT(DISTINCT h.scheme_id) FILTER (WHERE h.portfolio_date = CAST(:cur AS date))  AS schemes_cur,
+               COUNT(DISTINCT h.scheme_id) FILTER (WHERE h.portfolio_date = CAST(:prev AS date)) AS schemes_prev
+        FROM mf_holdings h
+        LEFT JOIN mf_instruments i ON i.isin = h.isin
+        WHERE h.portfolio_date IN (CAST(:cur AS date), CAST(:prev AS date))
+        GROUP BY h.isin, i.instrument, i.sector
+    """
+    df = pd.read_sql(text(sql), get_db(),
+                     params={"cur": current, "prev": previous or current})
+    if previous is None:
+        df["value_prev"] = None
+        df["schemes_prev"] = 0
+    for c in ("value_cur", "value_prev"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    for c in ("schemes_cur", "schemes_prev"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0).astype(int)
+    # Reported values are in rupee lakh; crore reads better at this scale.
+    df["value_cr"] = (df["value_cur"] / 100).round(2)
+    df["prev_cr"] = (df["value_prev"] / 100).round(2)
+    df["change_cr"] = (df["value_cr"] - df["prev_cr"]).round(2)
+    df["schemes_change"] = df["schemes_cur"] - df["schemes_prev"]
+    return df
+
+
+@st.cache_data(ttl=86400)
+def load_mf_schemes_holding(isin: str, current: str, previous: str | None) -> pd.DataFrame:
+    """Which schemes hold one stock, and how that changed."""
+    sql = """
+        SELECT s.scheme, s.category,
+               SUM(h.value_lakh)   FILTER (WHERE h.portfolio_date = CAST(:cur AS date))  AS value_cur,
+               SUM(h.value_lakh)   FILTER (WHERE h.portfolio_date = CAST(:prev AS date)) AS value_prev,
+               MAX(h.holdings_pct) FILTER (WHERE h.portfolio_date = CAST(:cur AS date))  AS pct_cur
+        FROM mf_holdings h
+        JOIN mf_schemes s ON s.scheme_id = h.scheme_id
+        WHERE h.isin = :isin
+          AND h.portfolio_date IN (CAST(:cur AS date), CAST(:prev AS date))
+        GROUP BY s.scheme, s.category
+    """
+    df = pd.read_sql(text(sql), get_db(),
+                     params={"isin": isin, "cur": current,
+                             "prev": previous or current})
+    for c in ("value_cur", "value_prev", "pct_cur"):
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
+    df["value_cr"] = (df["value_cur"] / 100).round(2)
+    df["change_cr"] = ((df["value_cur"] - df["value_prev"]) / 100).round(2)
+    df["pct of scheme"] = df["pct_cur"].round(2)
+    return df
+
+
+@st.cache_data(ttl=86400)
+def load_isin_symbol_map() -> pd.DataFrame:
+    """ISIN -> NSE symbol, from the symbol master file.
+
+    daily_prices has no ISIN column, and adding one would repeat 12 bytes
+    across 650k rows to answer a question only this tab asks. The master file
+    ships in the repo and is free to read.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "data", "symbol_master.csv")
+    try:
+        df = pd.read_csv(path, usecols=["symbol", "isin", "name"])
+        return df.dropna(subset=["isin"]).drop_duplicates("isin")
+    except Exception:
+        return pd.DataFrame({"symbol": [], "isin": [], "name": []})
+
+
 @st.cache_data(ttl=86400)  # refreshed monthly by the workflow
 def load_sectors() -> pd.DataFrame:
     """Sector per symbol. Returns an empty frame if the table isn't there yet,
@@ -697,9 +789,9 @@ if not indices_latest.empty:
     st.divider()
 
 (tab_stocks, tab_detail, tab_sectors, tab_scanners, tab_screener,
- tab_returns, tab_indices, tab_watchlist) = st.tabs(
+ tab_mf, tab_returns, tab_indices, tab_watchlist) = st.tabs(
     ["Stocks", "Stock detail", "Sectors", "Scanners", "Screener",
-     "Returns calculator", "All Indices", "Watchlist"]
+     "MF Investments", "Returns calculator", "All Indices", "Watchlist"]
 )
 
 # The newest trading day, enriched once and shared by the tabs that always
@@ -1126,6 +1218,165 @@ with tab_screener:
         "off_high_pct": "off high %"})
     show_table(table, hide_index=True, use_container_width=True, height=520)
     download_button(table, f"screen_{as_of_scr}.csv", "dl_screen")
+
+
+# =================================================== Tab 6: MF Investments
+with tab_mf:
+    mf_months = load_mf_months()
+    if not mf_months:
+        st.info(
+            "No mutual fund holdings stored yet. Run "
+            "`python scripts/fetch_mf_holdings.py` with ADVISORKHOJ_KEY set."
+        )
+    else:
+        st.caption(
+            "What fund managers actually bought and sold. Fund houses publish a "
+            "full portfolio once a month, so comparing consecutive month-ends "
+            "shows real money moving - a different signal from price action."
+        )
+
+        mc1, mc2 = st.columns(2)
+        cur_month = mc1.selectbox("Month", list(reversed(mf_months)), index=0,
+                                  key="mf_month")
+        idx = mf_months.index(cur_month)
+        prev_month = mf_months[idx - 1] if idx > 0 else None
+        if prev_month:
+            mc2.caption(f"Compared with **{prev_month}**")
+        else:
+            mc2.caption("Earliest month stored, so nothing to compare against.")
+
+        flows = load_mf_stock_flows(cur_month, prev_month)
+        if flows.empty:
+            st.info("No holdings for that month.")
+        else:
+            # Attach NSE symbols and the latest price move, so you can see where
+            # funds bought into weakness rather than chased strength.
+            iso = load_isin_symbol_map()
+            flows = flows.merge(iso[["isin", "symbol"]], on="isin", how="left")
+            px_cols = ["symbol", "close", "chg_pct"]
+            if "ret_1M" in latest_df.columns:
+                px_cols.append("ret_1M")
+            flows = flows.merge(latest_df[px_cols], on="symbol", how="left")
+            flows["stock"] = flows["symbol"].fillna(
+                flows["instrument"].str.title().str.slice(0, 28))
+
+            total_cr = flows["value_cr"].sum()
+            prev_total = flows["prev_cr"].sum()
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric("Equity held by funds", f"Rs {total_cr:,.0f}cr",
+                      f"{(total_cr / prev_total - 1) * 100:+.2f}%" if prev_total else None)
+            k2.metric("Stocks held", f"{int((flows['value_cr'] > 0).sum()):,}")
+            k3.metric("Mapped to NSE", f"{int(flows['symbol'].notna().sum()):,}")
+            k4.metric("Month", cur_month)
+
+            only_nse = st.checkbox(
+                "Only stocks listed on NSE (hides unlisted and overseas holdings)",
+                value=True, key="mf_only_nse")
+            view = flows[flows["symbol"].notna()] if only_nse else flows
+
+            DISPLAY = {"stock": "stock", "sector": "sector",
+                       "value_cr": "held (cr)", "change_cr": "change (cr)",
+                       "schemes_cur": "schemes", "schemes_change": "scheme chg",
+                       "chg_pct": "chg %", "ret_1M": "1M %"}
+
+            def mf_table(df, cols=None):
+                cols = [c for c in (cols or list(DISPLAY)) if c in df.columns]
+                return df[cols].rename(columns=DISPLAY)
+
+            if prev_month:
+                st.markdown("### Where the money went")
+                held_before = view[view["prev_cr"] > 0]
+                bought = held_before.sort_values("change_cr", ascending=False).head(25)
+                sold = held_before.sort_values("change_cr").head(25)
+                bc, sc = st.columns(2)
+                with bc:
+                    st.caption(f"Biggest increases - {cur_month}")
+                    t = mf_table(bought)
+                    show_table(t, hide_index=True, use_container_width=True, height=420)
+                    download_button(t, f"mf_bought_{cur_month}.csv", "dl_mf_buy")
+                with sc:
+                    st.caption(f"Biggest reductions - {cur_month}")
+                    t = mf_table(sold)
+                    show_table(t, hide_index=True, use_container_width=True, height=420)
+                    download_button(t, f"mf_sold_{cur_month}.csv", "dl_mf_sell")
+
+                st.markdown("### New positions and full exits")
+                st.caption("A stock funds held none of last month, or sold out of "
+                           "entirely. The clearest conviction signal in this data.")
+                entered = view[(view["prev_cr"] == 0) & (view["value_cr"] > 0)]
+                exited = view[(view["prev_cr"] > 0) & (view["value_cr"] == 0)]
+                ec, xc = st.columns(2)
+                with ec:
+                    st.caption(f"{len(entered)} new positions")
+                    show_table(
+                        mf_table(entered.sort_values("value_cr", ascending=False).head(25),
+                                 ["stock", "sector", "value_cr", "schemes_cur", "chg_pct"]),
+                        hide_index=True, use_container_width=True, height=360)
+                with xc:
+                    st.caption(f"{len(exited)} full exits")
+                    gone = exited.sort_values("prev_cr", ascending=False).head(25)
+                    gone = gone[["stock", "sector", "prev_cr", "schemes_prev", "chg_pct"]].rename(
+                        columns={"prev_cr": "was held (cr)", "schemes_prev": "schemes",
+                                 "chg_pct": "chg %"})
+                    show_table(gone, hide_index=True, use_container_width=True, height=360)
+
+                st.markdown("### Conviction spreading")
+                st.caption("Change in how many schemes hold the stock, regardless of "
+                           "size. More managers arriving is a broader signal than one "
+                           "large fund adding.")
+                conv = view[view["schemes_change"] != 0].sort_values(
+                    "schemes_change", ascending=False)
+                conv_cols = ["stock", "sector", "schemes_cur", "schemes_change", "change_cr"]
+                cc1, cc2 = st.columns(2)
+                with cc1:
+                    st.caption("More schemes holding")
+                    show_table(mf_table(conv.head(20), conv_cols),
+                               hide_index=True, use_container_width=True, height=340)
+                with cc2:
+                    st.caption("Fewer schemes holding")
+                    show_table(mf_table(conv.tail(20).sort_values("schemes_change"), conv_cols),
+                               hide_index=True, use_container_width=True, height=340)
+
+                st.markdown("### Sector flows")
+                sec = (view.assign(sector=view["sector"].fillna("Unknown"))
+                       .groupby("sector")
+                       .agg(held_cr=("value_cr", "sum"),
+                            change_cr=("change_cr", "sum"),
+                            stocks=("isin", "count"))
+                       .round(2)
+                       .sort_values("change_cr", ascending=False)
+                       .reset_index()
+                       .rename(columns={"held_cr": "held (cr)",
+                                        "change_cr": "change (cr)"}))
+                st.bar_chart(sec.set_index("sector")["change (cr)"], height=300)
+                show_table(sec, hide_index=True, use_container_width=True)
+                download_button(sec, f"mf_sector_flows_{cur_month}.csv", "dl_mf_sector")
+
+            st.markdown("### Most widely held")
+            show_table(mf_table(view.sort_values("schemes_cur", ascending=False).head(30)),
+                       hide_index=True, use_container_width=True, height=420)
+            download_button(mf_table(view.sort_values("value_cr", ascending=False)),
+                            f"mf_holdings_{cur_month}.csv", "dl_mf_all")
+
+            st.markdown("### Which funds hold a stock")
+            pick_opts = view.sort_values("value_cr", ascending=False)["stock"].tolist()
+            if pick_opts:
+                picked = st.selectbox("Stock", pick_opts, key="mf_pick")
+                row = view[view["stock"] == picked]
+                if not row.empty:
+                    holders = load_mf_schemes_holding(
+                        row.iloc[0]["isin"], cur_month, prev_month)
+                    holders = holders[holders["value_cr"] > 0].sort_values(
+                        "value_cr", ascending=False)
+                    st.caption(f"{len(holders)} schemes hold {picked} "
+                               f"(Rs {row.iloc[0]['value_cr']:,.0f}cr in total)")
+                    show_table(
+                        holders[["scheme", "category", "value_cr", "change_cr",
+                                 "pct of scheme"]]
+                        .rename(columns={"value_cr": "held (cr)",
+                                         "change_cr": "change (cr)"}),
+                        hide_index=True, use_container_width=True, height=420)
+                    download_button(holders, f"mf_holders_{picked}.csv", "dl_mf_holders")
 
 
 # ==================================================== Tab 2: Returns calculator
