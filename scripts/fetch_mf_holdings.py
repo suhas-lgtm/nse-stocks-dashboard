@@ -43,12 +43,21 @@ PORTFOLIO_URL = BASE + "getMutualfundHistoricalPortfolio"
 CATEGORY_PREFIXES = ("Equity", "Hybrid", "ELSS", "Index", "Retirement",
                      "Childrens", "Fund of Funds-Domestic-Equity")
 
-WORKERS = 8
-REQUEST_TIMEOUT = 60
-RETRIES = 3
-RETRY_BACKOFF = 5
-PAUSE_EVERY = 200          # requests
-PAUSE_SECONDS = 2
+class RateLimited(RuntimeError):
+    """The API asked us to slow down."""
+
+
+# Four, not eight: the API rate-limits at bulk volume and extra parallelism
+# only buys more 429s.
+DEFAULT_WORKERS = 4
+RATE_LIMIT_RETRIES = 6
+RATE_LIMIT_BACKOFF = 20    # seconds, multiplied by the attempt number
+REQUEST_TIMEOUT = 30
+RETRIES = 2
+RETRY_BACKOFF = 2
+PAUSE_EVERY = 500          # requests
+PAUSE_SECONDS = 1
+PROGRESS_EVERY = 250
 
 MONTH_NAMES = [m.lower() for m in calendar.month_name[1:]]
 
@@ -63,13 +72,33 @@ def api_key() -> str:
 
 
 def get_json(url: str, params: dict) -> dict:
+    """GET with backoff. 429 is handled separately and patiently.
+
+    Advisorkhoj rate-limits hard at bulk volume — a six-month run across ~1,160
+    schemes is ~7,000 requests and gets 429s partway. Treating that like any
+    other error just burns the remaining attempts and loses the scheme, so a
+    429 waits much longer and gets more tries.
+    """
     last = None
     for attempt in range(1, RETRIES + 1):
         try:
             resp = requests.get(url, params=params, timeout=REQUEST_TIMEOUT)
             if resp.status_code == 200:
                 return resp.json()
+            if resp.status_code == 429:
+                wait = RATE_LIMIT_BACKOFF * attempt
+                retry_after = resp.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    wait = max(wait, int(retry_after))
+                last = "HTTP 429 (rate limited)"
+                if attempt < RATE_LIMIT_RETRIES:
+                    time.sleep(wait)
+                    continue
+                raise RateLimited(f"{url}: still rate limited after "
+                                  f"{RATE_LIMIT_RETRIES} attempts")
             last = f"HTTP {resp.status_code}"
+        except RateLimited:
+            raise
         except Exception as e:
             last = f"{type(e).__name__}: {e}"
         if attempt < RETRIES:
@@ -122,6 +151,28 @@ def fetch_portfolio(key: str, scheme: str, year: int, month: str) -> list[dict]:
     return [r for r in rows if (r.get("asset_class") or "") == "Equity"]
 
 
+def month_end(year: int, month_name: str) -> str:
+    """The date a portfolio for that month is published under (its last day)."""
+    m = MONTH_NAMES.index(month_name) + 1
+    return f"{year:04d}-{m:02d}-{calendar.monthrange(year, m)[1]:02d}"
+
+
+def already_stored(engine, dates: list[str]) -> set:
+    """(scheme_id, portfolio_date) pairs we already hold, so a re-run resumes
+    instead of refetching everything. A fetch this long will be interrupted."""
+    from sqlalchemy import text
+    if not dates:
+        return set()
+    names = [f"d{i}" for i in range(len(dates))]
+    ph = ", ".join(f":{n}" for n in names)
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(f"""SELECT scheme_id, portfolio_date::text FROM mf_holdings
+                     WHERE portfolio_date IN ({ph})"""),
+            dict(zip(names, dates))).fetchall()
+    return {(r[0], r[1]) for r in rows}
+
+
 def parse_date(ddmmyyyy: str) -> str | None:
     try:
         d, m, y = ddmmyyyy.split("-")
@@ -138,6 +189,10 @@ def main() -> int:
                     help="specific categories instead of all equity-ish ones")
     ap.add_argument("--limit-schemes", type=int, default=None,
                     help="only the first N schemes, for a quick test run")
+    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                    help=f"parallel requests (default {DEFAULT_WORKERS})")
+    ap.add_argument("--refetch", action="store_true",
+                    help="refetch scheme-months already stored")
     args = ap.parse_args()
 
     key = api_key()
@@ -162,78 +217,107 @@ def main() -> int:
         scheme_ids = dict(conn.execute(
             text("SELECT scheme, scheme_id FROM mf_schemes")).fetchall())
 
-    # --- fetch ------------------------------------------------------------
-    jobs = [(s, y, m) for (s, _c) in schemes for (y, m) in months]
-    holdings: list[dict] = []
-    instruments: dict[str, dict] = {}
-    done = empty = failed = 0
+    # --- fetch, one month at a time ---------------------------------------
+    # Written per month rather than once at the end: this runs for a long time
+    # against a throttled API, and an interruption used to discard everything.
+    month_dates = [month_end(y, m) for y, m in months]
+    stored = set() if args.refetch else already_stored(engine, month_dates)
+    if stored:
+        print(f"{len(stored):,} scheme-months already stored, skipping those.\n")
 
-    def work(job):
-        scheme, year, month = job
-        try:
-            return scheme, fetch_portfolio(key, scheme, year, month), None
-        except Exception as e:
-            return scheme, [], e
+    grand_holdings = grand_failed = 0
+    months_seen: list[str] = []
 
-    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-        for scheme, rows, err in pool.map(work, jobs):
-            done += 1
-            if err is not None:
-                failed += 1
-            elif not rows:
-                empty += 1
-            for r in rows:
-                pdate = parse_date(r.get("portfolio_date") or "")
-                isin = (r.get("isin") or "").strip()
-                sid = scheme_ids.get(scheme)
-                if not (pdate and isin and sid):
-                    continue
-                holdings.append({
-                    "portfolio_date": pdate, "scheme_id": sid, "isin": isin,
-                    "value_lakh": r.get("value"),
-                    "holdings_pct": r.get("holdings"),
-                })
-                instruments.setdefault(isin, {
-                    "isin": isin, "instrument": r.get("instrument"),
-                    "sector": r.get("sector"), "industry": r.get("industry"),
-                })
-            if done % PAUSE_EVERY == 0:
-                print(f"  {done:,}/{len(jobs):,} requests, "
-                      f"{len(holdings):,} holdings so far", flush=True)
-                time.sleep(PAUSE_SECONDS)
+    for (year, month_name), pdate in zip(months, month_dates):
+        todo = [s for s, _c in schemes
+                if args.refetch or (scheme_ids.get(s), pdate) not in stored]
+        if not todo:
+            print(f"{month_name} {year}: already complete, skipped")
+            continue
 
-    print(f"\n{done:,} requests: {done - empty - failed:,} with data, "
-          f"{empty:,} with no published portfolio, {failed:,} failed")
+        print(f"{month_name} {year} ({pdate}): {len(todo):,} schemes to fetch")
+        holdings: list[dict] = []
+        instruments: dict[str, dict] = {}
+        done = empty = failed = 0
 
-    if not holdings:
-        print("ERROR: no holdings fetched — not writing anything.")
-        return 1
+        def work(scheme):
+            try:
+                return scheme, fetch_portfolio(key, scheme, year, month_name), None
+            except Exception as e:
+                return scheme, [], e
 
-    # Same (date, scheme, isin) can appear twice when a fund lists a stock
-    # under two instrument descriptions; Postgres refuses an upsert that
-    # touches one row twice, so collapse first.
-    deduped = {(h["portfolio_date"], h["scheme_id"], h["isin"]): h
-               for h in holdings}
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            for scheme, rows, err in pool.map(work, todo):
+                done += 1
+                if err is not None:
+                    failed += 1
+                elif not rows:
+                    empty += 1
+                for r in rows:
+                    rdate = parse_date(r.get("portfolio_date") or "")
+                    isin = (r.get("isin") or "").strip()
+                    sid = scheme_ids.get(scheme)
+                    if not (rdate and isin and sid):
+                        continue
+                    holdings.append({
+                        "portfolio_date": rdate, "scheme_id": sid, "isin": isin,
+                        "value_lakh": r.get("value"),
+                        "holdings_pct": r.get("holdings"),
+                    })
+                    instruments.setdefault(isin, {
+                        "isin": isin, "instrument": r.get("instrument"),
+                        "sector": r.get("sector"), "industry": r.get("industry"),
+                    })
+                if done % PROGRESS_EVERY == 0:
+                    print(f"    {done:,}/{len(todo):,} schemes, "
+                          f"{len(holdings):,} holdings", flush=True)
+                if done % PAUSE_EVERY == 0:
+                    time.sleep(PAUSE_SECONDS)
 
-    bulk_upsert(engine, "mf_instruments",
-                ["isin", "instrument", "sector", "industry"],
-                list(instruments.values()), conflict_cols=["isin"],
-                update_cols=["instrument", "sector", "industry"])
-    bulk_upsert(engine, "mf_holdings",
-                ["portfolio_date", "scheme_id", "isin", "value_lakh", "holdings_pct"],
-                list(deduped.values()),
-                conflict_cols=["portfolio_date", "scheme_id", "isin"],
-                update_cols=["value_lakh", "holdings_pct"])
+        if not holdings:
+            print(f"  no holdings published for {month_name} {year} "
+                  f"({failed:,} request failures)")
+            grand_failed += failed
+            continue
 
+        # The same (date, scheme, isin) can appear twice when a fund lists a
+        # stock under two descriptions; Postgres refuses an upsert touching one
+        # row twice, so collapse before writing.
+        deduped = {(h["portfolio_date"], h["scheme_id"], h["isin"]): h
+                   for h in holdings}
+        bulk_upsert(engine, "mf_instruments",
+                    ["isin", "instrument", "sector", "industry"],
+                    list(instruments.values()), conflict_cols=["isin"],
+                    update_cols=["instrument", "sector", "industry"])
+        bulk_upsert(engine, "mf_holdings",
+                    ["portfolio_date", "scheme_id", "isin", "value_lakh",
+                     "holdings_pct"],
+                    list(deduped.values()),
+                    conflict_cols=["portfolio_date", "scheme_id", "isin"],
+                    update_cols=["value_lakh", "holdings_pct"])
+        grand_holdings += len(deduped)
+        grand_failed += failed
+        months_seen.append(pdate)
+        print(f"  wrote {len(deduped):,} holdings "
+              f"({done - empty - failed:,} schemes reported, {empty:,} had no "
+              f"portfolio, {failed:,} failed)\n", flush=True)
+
+    if not months_seen:
+        print("Nothing new fetched.")
+        return 0
+
+    from sqlalchemy import text
     with engine.begin() as conn:
         conn.execute(text(
             """INSERT INTO meta (key, value) VALUES ('mf_holdings_updated_utc', :v)
                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value"""),
             {"v": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())})
 
-    months_seen = sorted({h["portfolio_date"] for h in deduped.values()})
-    print(f"\nWrote {len(deduped):,} holdings across {len(instruments):,} stocks "
-          f"and {len(months_seen)} month-ends ({months_seen[0]} to {months_seen[-1]}).")
+    print(f"Wrote {grand_holdings:,} holdings across {len(months_seen)} "
+          f"month-end(s): {', '.join(months_seen)}")
+    if grand_failed:
+        print(f"{grand_failed:,} requests failed. Re-run to pick them up — "
+              f"months already stored are skipped.")
     return 0
 
 

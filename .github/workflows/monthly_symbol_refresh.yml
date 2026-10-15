@@ -49,7 +49,11 @@ jobs:
         if: env.ADVISORKHOJ_KEY != ''
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/fetch_mf_holdings.py --months 6
+        # One month per run, not six. The API rate-limits at bulk volume,
+        # and the fetch is resumable — months already stored are skipped — so
+        # history fills in over successive monthly runs instead of one long
+        # burst that gets throttled.
+        run: python scripts/fetch_mf_holdings.py --months 1
 
       - name: Refresh shares outstanding from Yahoo Finance
         env:
