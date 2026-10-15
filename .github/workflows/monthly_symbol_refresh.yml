@@ -14,6 +14,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      # Hoisted to job level so the Advisorkhoj step's `if` can test it: the
+      # `secrets` context is not available in `if`, only `env` and friends.
+      ADVISORKHOJ_KEY: ${{ secrets.ADVISORKHOJ_KEY }}
     steps:
       - uses: actions/checkout@v4
 
@@ -38,20 +42,19 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python scripts/fetch_sectors.py
 
-      - name: Refresh shares outstanding from Yahoo Finance
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        run: python scripts/fetch_shares_outstanding.py
-
       # Fund houses publish portfolios monthly, so this runs on the same
       # cadence. Skipped when ADVISORKHOJ_KEY isn't set, so a fork or a repo
       # without the key still gets a green run.
       - name: Refresh mutual fund holdings from Advisorkhoj
-        if: ${{ secrets.ADVISORKHOJ_KEY != '' }}
+        if: env.ADVISORKHOJ_KEY != ''
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          ADVISORKHOJ_KEY: ${{ secrets.ADVISORKHOJ_KEY }}
         run: python scripts/fetch_mf_holdings.py --months 6
+
+      - name: Refresh shares outstanding from Yahoo Finance
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python scripts/fetch_shares_outstanding.py
 
       - name: Commit symbol master if changed
         run: |

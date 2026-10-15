@@ -28,6 +28,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      # Workflow files are only validated by GitHub when a run starts, and
+      # an invalid one fails with no jobs and nothing to click into.
+      - name: Validate workflow files
+        run: python tests/check_workflows.py
+
       # Render the dashboard headlessly against fixtures. Catches broken
       # column references and bad maths across every tab without a browser.
       - name: Render dashboard (headless)
