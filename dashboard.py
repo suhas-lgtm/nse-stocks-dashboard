@@ -1306,32 +1306,45 @@ with tab_mf:
                 value=True, key="mf_only_nse")
             view = flows[flows["symbol"].notna()] if only_nse else flows
 
-            # "chg_pct" and "ret_1M" are the share price, not the holding.
-            # Labelled explicitly: a column reading "1M %" beside fund flows
-            # invites exactly the wrong reading.
+            # Deliberately no share-price columns. This tab answers one
+            # question — is fund money going into this stock or out of it —
+            # and a price column beside the flow invites reading one as the
+            # other. Price lives on the Stocks and Stock detail tabs.
             DISPLAY = {"stock": "stock", "sector": "sector",
-                       "value_cr": "held (cr)", "change_cr": "change (cr)",
-                       "change_pct": "holding chg %",
-                       "schemes_cur": "schemes", "schemes_change": "scheme chg",
-                       "chg_pct": "price chg %", "ret_1M": "price 1M %"}
+                       "change_pct": "MF exposure chg %",
+                       "change_cr": "change (cr)",
+                       "value_cr": "held (cr)", "prev_cr": "held before (cr)",
+                       "schemes_cur": "schemes", "schemes_change": "scheme chg"}
 
             def mf_table(df, cols=None):
                 cols = [c for c in (cols or list(DISPLAY)) if c in df.columns]
                 return df[cols].rename(columns=DISPLAY)
 
             if prev_month:
-                st.markdown("### Where the money went")
-                held_before = view[view["prev_cr"] > 0]
-                bought = held_before.sort_values("change_cr", ascending=False).head(25)
-                sold = held_before.sort_values("change_cr").head(25)
+                st.markdown("### Biggest changes in fund exposure")
+                st.caption(
+                    "Ranked by percentage change in what funds hold, not by "
+                    "rupees: funds doubling a small position says more than a "
+                    "large fund topping up a huge one. Only stocks funds "
+                    "already held are shown — brand new positions are below."
+                )
+                MIN_BASE_CR = st.number_input(
+                    "Ignore positions smaller than this (cr)", min_value=0.0,
+                    value=10.0, step=5.0, key="mf_min_base",
+                    help="A position going from 0.2cr to 0.6cr is +200% and "
+                         "usually noise.")
+                held_before = view[view["prev_cr"] >= (MIN_BASE_CR or 0)]
+                held_before = held_before[held_before["change_pct"].notna()]
+                bought = held_before.sort_values("change_pct", ascending=False).head(25)
+                sold = held_before.sort_values("change_pct").head(25)
                 bc, sc = st.columns(2)
                 with bc:
-                    st.caption(f"Biggest increases - {cur_month}")
+                    st.caption(f"Funds increased exposure most - {cur_month}")
                     t = mf_table(bought)
                     show_table(t, hide_index=True, use_container_width=True, height=420)
                     download_button(t, f"mf_bought_{cur_month}.csv", "dl_mf_buy")
                 with sc:
-                    st.caption(f"Biggest reductions - {cur_month}")
+                    st.caption(f"Funds cut exposure most - {cur_month}")
                     t = mf_table(sold)
                     show_table(t, hide_index=True, use_container_width=True, height=420)
                     download_button(t, f"mf_sold_{cur_month}.csv", "dl_mf_sell")
@@ -1346,14 +1359,13 @@ with tab_mf:
                     st.caption(f"{len(entered)} new positions")
                     show_table(
                         mf_table(entered.sort_values("value_cr", ascending=False).head(25),
-                                 ["stock", "sector", "value_cr", "schemes_cur", "chg_pct"]),
+                                 ["stock", "sector", "value_cr", "schemes_cur"]),
                         hide_index=True, use_container_width=True, height=360)
                 with xc:
                     st.caption(f"{len(exited)} full exits")
                     gone = exited.sort_values("prev_cr", ascending=False).head(25)
-                    gone = gone[["stock", "sector", "prev_cr", "schemes_prev", "chg_pct"]].rename(
-                        columns={"prev_cr": "was held (cr)", "schemes_prev": "schemes",
-                                 "chg_pct": "chg %"})
+                    gone = gone[["stock", "sector", "prev_cr", "schemes_prev"]].rename(
+                        columns={"prev_cr": "was held (cr)", "schemes_prev": "schemes"})
                     show_table(gone, hide_index=True, use_container_width=True, height=360)
 
                 st.markdown("### Conviction spreading")
@@ -1363,7 +1375,7 @@ with tab_mf:
                 conv = view[view["schemes_change"] != 0].sort_values(
                     "schemes_change", ascending=False)
                 conv_cols = ["stock", "sector", "schemes_cur", "schemes_change",
-                             "change_cr", "change_pct"]
+                             "change_pct", "change_cr"]
                 cc1, cc2 = st.columns(2)
                 with cc1:
                     st.caption("More schemes holding")
@@ -1478,25 +1490,78 @@ with tab_mf:
                         st.caption(f"Total held by all mutual funds in "
                                    f"{chart_pick}, rupee crore, by month-end.")
 
-            st.markdown("### Which funds hold a stock")
+            st.markdown("### Look up a stock")
+            st.caption(
+                "How fund exposure to one stock has moved, and who is holding it."
+            )
             pick_opts = view.sort_values("value_cr", ascending=False)["stock"].tolist()
             if pick_opts:
                 picked = st.selectbox("Stock", pick_opts, key="mf_pick")
                 row = view[view["stock"] == picked]
                 if not row.empty:
+                    picked_isin = row.iloc[0]["isin"]
+
+                    # Exposure over every stored month, for this stock alone.
+                    all_trend = load_mf_trend()
+                    mine = (all_trend[all_trend["isin"] == picked_isin]
+                            .sort_values("month"))
+                    if not mine.empty:
+                        mine = mine.assign(
+                            held_cr=(mine["value_lakh"] / 100).round(2))
+                        series = mine.set_index("month")["held_cr"]
+
+                        # Change over 1 / 3 / 6 month-ends, as far back as we
+                        # hold data. Holdings are monthly, so a one-week
+                        # window does not exist — the shortest real step is a
+                        # month.
+                        latest = series.iloc[-1]
+                        cards = st.columns(4)
+                        cards[0].metric("Held now", f"Rs {latest:,.0f}cr")
+                        for col, back, label in [(cards[1], 1, "1 month"),
+                                                 (cards[2], 3, "3 months"),
+                                                 (cards[3], 6, "6 months")]:
+                            if len(series) > back:
+                                before = series.iloc[-1 - back]
+                                delta = latest - before
+                                pct = ((latest / before - 1) * 100
+                                       if before else None)
+                                col.metric(
+                                    label, f"{delta:+,.0f}cr",
+                                    f"{pct:+.1f}%" if pct is not None else None)
+                            else:
+                                col.metric(label, "—",
+                                           help="Not enough months stored yet.")
+
+                        st.line_chart(series, height=260)
+                        st.caption(f"Total held by all mutual funds in {picked}, "
+                                   f"rupee crore, at each month-end.")
+
+                        mom = pd.DataFrame({
+                            "month": series.index,
+                            "held (cr)": series.values,
+                            "schemes": mine["schemes"].values,
+                        })
+                        mom["change (cr)"] = mom["held (cr)"].diff().round(2)
+                        mom["MF exposure chg %"] = (
+                            mom["held (cr)"].pct_change() * 100).round(2)
+                        show_table(mom.iloc[::-1], hide_index=True,
+                                   use_container_width=True)
+                        download_button(mom, f"mf_exposure_{picked}.csv",
+                                        "dl_mf_stock_trend")
+
                     holders = load_mf_schemes_holding(
-                        row.iloc[0]["isin"], cur_month, prev_month)
+                        picked_isin, cur_month, prev_month)
                     holders = holders[holders["value_cr"] > 0].sort_values(
                         "value_cr", ascending=False)
-                    st.caption(f"{len(holders)} schemes hold {picked} "
-                               f"(Rs {row.iloc[0]['value_cr']:,.0f}cr in total)")
+                    st.markdown(f"**{len(holders)} schemes hold {picked}**")
                     show_table(
                         holders[["scheme", "category", "value_cr", "change_cr",
                                  "pct of scheme"]]
                         .rename(columns={"value_cr": "held (cr)",
                                          "change_cr": "change (cr)"}),
-                        hide_index=True, use_container_width=True, height=420)
-                    download_button(holders, f"mf_holders_{picked}.csv", "dl_mf_holders")
+                        hide_index=True, use_container_width=True, height=380)
+                    download_button(holders, f"mf_holders_{picked}.csv",
+                                    "dl_mf_holders")
 
 
 # ==================================================== Tab 2: Returns calculator
