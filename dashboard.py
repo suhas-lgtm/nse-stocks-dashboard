@@ -1310,14 +1310,34 @@ with tab_mf:
             # question — is fund money going into this stock or out of it —
             # and a price column beside the flow invites reading one as the
             # other. Price lives on the Stocks and Stock detail tabs.
+            def month_label(iso: str | None) -> str:
+                """2026-08-31 -> Aug 2026. Column headers name their month, so
+                a table read on its own still says which months it compares."""
+                if not iso:
+                    return "before"
+                try:
+                    return datetime.strptime(iso, "%Y-%m-%d").strftime("%b %Y")
+                except ValueError:
+                    return iso
+
+            cur_lbl, prev_lbl = month_label(cur_month), month_label(prev_month)
             DISPLAY = {"stock": "stock", "sector": "sector",
                        "change_pct": "MF exposure chg %",
                        "change_cr": "change (cr)",
-                       "value_cr": "held (cr)", "prev_cr": "held before (cr)",
-                       "schemes_cur": "schemes", "schemes_change": "scheme chg"}
+                       "value_cr": f"held {cur_lbl} (cr)",
+                       "prev_cr": f"held {prev_lbl} (cr)",
+                       "schemes_cur": f"schemes {cur_lbl}",
+                       "schemes_prev": f"schemes {prev_lbl}",
+                       "schemes_change": "scheme chg"}
+
+            # Default column order: the two months, then the change between
+            # them, then how many schemes.
+            DEFAULT_COLS = ["stock", "sector", "prev_cr", "value_cr",
+                            "change_cr", "change_pct", "schemes_cur",
+                            "schemes_change"]
 
             def mf_table(df, cols=None):
-                cols = [c for c in (cols or list(DISPLAY)) if c in df.columns]
+                cols = [c for c in (cols or DEFAULT_COLS) if c in df.columns]
                 return df[cols].rename(columns=DISPLAY)
 
             if prev_month:
@@ -1365,7 +1385,8 @@ with tab_mf:
                     st.caption(f"{len(exited)} full exits")
                     gone = exited.sort_values("prev_cr", ascending=False).head(25)
                     gone = gone[["stock", "sector", "prev_cr", "schemes_prev"]].rename(
-                        columns={"prev_cr": "was held (cr)", "schemes_prev": "schemes"})
+                        columns={"prev_cr": f"was held {prev_lbl} (cr)",
+                                 "schemes_prev": f"schemes {prev_lbl}"})
                     show_table(gone, hide_index=True, use_container_width=True, height=360)
 
                 st.markdown("### Conviction spreading")
