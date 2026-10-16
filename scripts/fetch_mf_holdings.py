@@ -88,8 +88,13 @@ def month_is_published(key: str, year: int, month: str,
         probes = candidates[:4]
     for scheme in probes:
         try:
-            if fetch_portfolio(key, scheme, year, month):
+            if fetch_portfolio(key, scheme, year, month, patient=False):
                 return True
+        except RateLimited:
+            # Can't tell whether the month exists while being throttled, and
+            # guessing "no" would skip a month that is really there. Stop and
+            # say so; the run is resumable, so nothing is lost by waiting.
+            raise
         except Exception:
             pass
         time.sleep(0.3)
@@ -105,7 +110,7 @@ def api_key() -> str:
     return key
 
 
-def get_json(url: str, params: dict) -> dict:
+def get_json(url: str, params: dict, patient: bool = True) -> dict:
     """GET with backoff. 429 is handled separately and patiently.
 
     Advisorkhoj rate-limits hard at bulk volume — a six-month run across ~1,160
@@ -120,6 +125,10 @@ def get_json(url: str, params: dict) -> dict:
             if resp.status_code == 200:
                 return resp.json()
             if resp.status_code == 429:
+                if not patient:
+                    # Probes must not wait. A probe that sat through the full
+                    # backoff once took 47 minutes to answer a yes/no.
+                    raise RateLimited(f"{url}: rate limited")
                 wait = RATE_LIMIT_BACKOFF * attempt
                 retry_after = resp.headers.get("Retry-After")
                 if retry_after and retry_after.isdigit():
@@ -175,10 +184,12 @@ def list_schemes(key: str, categories: list[str] | None) -> list[tuple[str, str]
     return pairs
 
 
-def fetch_portfolio(key: str, scheme: str, year: int, month: str) -> list[dict]:
+def fetch_portfolio(key: str, scheme: str, year: int, month: str,
+                    patient: bool = True) -> list[dict]:
     """Equity holdings for one scheme-month, or [] when none is published."""
     data = get_json(PORTFOLIO_URL, {
-        "scheme_amfi_common": scheme, "year": year, "month": month, "key": key})
+        "scheme_amfi_common": scheme, "year": year, "month": month, "key": key},
+        patient=patient)
     # status 400 with an empty list simply means "no portfolio for that month",
     # which is normal for recent months and for funds that launched later.
     rows = data.get("historicalSchemePortfolioList") or []
@@ -281,7 +292,17 @@ def main() -> int:
             continue
 
         # Six requests to find out whether the month exists at all.
-        if not month_is_published(key, year, month_name, [s for s, _c in schemes]):
+        try:
+            published = month_is_published(key, year, month_name,
+                                           [s for s, _c in schemes])
+        except RateLimited:
+            print()
+            print(f"STOPPING: the API is rate limiting us, so there is no "
+                  f"way to tell whether {month_name} {year} exists.")
+            print("Whatever was written before this point is saved. Wait an "
+                  "hour or two and run again — stored months are skipped.")
+            break
+        if not published:
             print(f"{month_name} {year}: not published yet - looking further back")
             continue
 

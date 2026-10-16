@@ -1511,6 +1511,108 @@ with tab_mf:
                         st.caption(f"Total held by all mutual funds in "
                                    f"{chart_pick}, rupee crore, by month-end.")
 
+            st.markdown("### Compare any two months")
+            st.caption(
+                "Pick a from-month and a to-month — they do not have to be "
+                "next to each other. June to August shows what funds did over "
+                "the whole quarter, not just the last step. More months appear "
+                "here as they are fetched."
+            )
+            cmp1, cmp2 = st.columns(2)
+            cmp_from = cmp1.selectbox(
+                "From", mf_months, index=0, key="mf_cmp_from",
+                format_func=month_label)
+            cmp_to = cmp2.selectbox(
+                "To", mf_months, index=len(mf_months) - 1, key="mf_cmp_to",
+                format_func=month_label)
+
+            if cmp_from == cmp_to:
+                st.info("Pick two different months.")
+            elif cmp_from > cmp_to:
+                st.error("'From' must be the earlier month.")
+            else:
+                # load_mf_stock_flows takes arbitrary months, so the same
+                # query serves this as the consecutive-month view above.
+                span = load_mf_stock_flows(cmp_to, cmp_from)
+                span = span.merge(load_isin_symbol_map()[["isin", "symbol"]],
+                                  on="isin", how="left")
+                span["stock"] = span["symbol"].fillna(
+                    span["instrument"].str.title().str.slice(0, 28))
+                if only_nse:
+                    span = span[span["symbol"].notna()]
+
+                f_lbl, t_lbl = month_label(cmp_from), month_label(cmp_to)
+                span_min = st.number_input(
+                    f"Ignore positions smaller than this in {f_lbl} (cr)",
+                    min_value=0.0, value=10.0, step=5.0, key="mf_cmp_min")
+                ranked = span[(span["prev_cr"] >= (span_min or 0))
+                              & span["change_pct"].notna()]
+                ranked = ranked.sort_values("change_pct", ascending=False)
+
+                st.caption(f"{len(ranked):,} stocks held in both {f_lbl} and {t_lbl}")
+                span_cols = ["stock", "sector", "prev_cr", "value_cr",
+                             "change_cr", "change_pct", "schemes_prev",
+                             "schemes_cur", "schemes_change"]
+                span_tbl = ranked[span_cols].rename(columns={
+                    "prev_cr": f"held {f_lbl} (cr)",
+                    "value_cr": f"held {t_lbl} (cr)",
+                    "change_cr": "change (cr)",
+                    "change_pct": "MF exposure chg %",
+                    "schemes_prev": f"schemes {f_lbl}",
+                    "schemes_cur": f"schemes {t_lbl}",
+                    "schemes_change": "scheme chg"})
+                show_table(span_tbl, hide_index=True,
+                           use_container_width=True, height=460)
+                download_button(span_tbl,
+                                f"mf_exposure_{cmp_from}_to_{cmp_to}.csv",
+                                "dl_mf_span")
+
+            st.markdown("### Every stock, every month")
+            st.caption(
+                "One row per stock, one column per month-end, in rupee crore. "
+                "The last two columns are the change across the most recent "
+                "pair of months."
+            )
+            full = load_mf_trend()
+            if full.empty:
+                st.info("No fund holdings stored yet.")
+            else:
+                grid = (full.pivot_table(index="isin", columns="month",
+                                         values="value_lakh", aggfunc="sum")
+                        .fillna(0) / 100).round(2)
+                gcols = list(grid.columns)
+                names = (full.sort_values("month").groupby("isin")
+                         .agg(instrument=("instrument", "last"),
+                              sector=("sector", "last")))
+                grid = grid.join(names).reset_index()
+                grid = grid.merge(load_isin_symbol_map()[["isin", "symbol"]],
+                                  on="isin", how="left")
+                grid["stock"] = grid["symbol"].fillna(
+                    grid["instrument"].str.title().str.slice(0, 28))
+                if only_nse:
+                    grid = grid[grid["symbol"].notna()]
+
+                if len(gcols) >= 2:
+                    a, b = gcols[-2], gcols[-1]
+                    chg_label = f"{month_label(a)} to {month_label(b)} %"
+                    grid["chg_cr"] = (grid[b] - grid[a]).round(2)
+                    grid[chg_label] = pd.Series(
+                        [round((y / x - 1) * 100, 2) if x and x > 0 else None
+                         for x, y in zip(grid[a], grid[b])], index=grid.index)
+                    grid = grid.sort_values(chg_label, ascending=False)
+                    tail = ["chg_cr", chg_label]
+                else:
+                    grid = grid.sort_values(gcols[-1], ascending=False)
+                    tail = []
+
+                out = grid[["stock", "sector"] + gcols + tail].rename(
+                    columns={c: month_label(c) for c in gcols}
+                    | {"chg_cr": "change (cr)"})
+                show_table(out, hide_index=True, use_container_width=True,
+                           height=520)
+                download_button(out, "mf_every_stock_every_month.csv",
+                                "dl_mf_grid")
+
             st.markdown("### Look up a stock")
             st.caption(
                 "How fund exposure to one stock has moved, and who is holding it."
