@@ -111,6 +111,17 @@ def fake_read_sql(sql, con, params=None):
                                 "close": np.random.uniform(20, 3000, len(SYMS))})
                   for d in (params or {}).values()]
         return pd.concat(frames) if frames else pd.DataFrame()
+    if "FROM mf_holdings" in q and "GROUP BY h.portfolio_date" in q:
+        months = ["2026-06-30", "2026-07-31", "2026-08-31"]
+        rows = []
+        for m in months:
+            for i, sym in enumerate(SYMS):
+                rows.append({"month": m, "isin": f"INE{i:09d}",
+                             "instrument": f"{sym} LIMITED EQ",
+                             "sector": random.choice(SECTORS),
+                             "value_lakh": float(np.random.uniform(0, 50000)),
+                             "schemes": int(np.random.randint(0, 60))})
+        return pd.DataFrame(rows)
     if "FROM mf_holdings" in q and "mf_schemes" in q:
         # schemes holding one stock
         return pd.DataFrame({

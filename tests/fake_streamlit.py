@@ -59,6 +59,15 @@ AGGRESSIVE = os.environ.get("FAKE_ST_AGGRESSIVE") == "1"
 def checkbox(label, value=False, **k):
     return (not value) if AGGRESSIVE else value
 def slider(label, lo, hi, default=None, step=None, **k): return default if default is not None else lo
+def radio(label, options, index=0, horizontal=False, **k):
+    opts = list(options)
+    if not opts:
+        return None
+    if AGGRESSIVE and len(opts) > 1:
+        return opts[-1]
+    return opts[index]
+
+
 def selectbox(label, options, index=0, **k):
     opts = list(options)
     if not opts:

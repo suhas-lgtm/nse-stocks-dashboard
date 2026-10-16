@@ -458,8 +458,35 @@ def load_mf_stock_flows(current: str, previous: str | None) -> pd.DataFrame:
     df["value_cr"] = (df["value_cur"] / 100).round(2)
     df["prev_cr"] = (df["value_prev"] / 100).round(2)
     df["change_cr"] = (df["value_cr"] - df["prev_cr"]).round(2)
+    # How much the holding itself moved, in percent. A 20 cr increase means
+    # something very different on a 40 cr position than on a 4,000 cr one.
+    # Undefined where funds held nothing last month — that is a new position,
+    # not an infinite increase.
+    df["change_pct"] = pd.Series(
+        [round((c / p - 1) * 100, 2) if p and p > 0 else None
+         for c, p in zip(df["value_cr"], df["prev_cr"])], index=df.index)
     df["schemes_change"] = df["schemes_cur"] - df["schemes_prev"]
     return df
+
+
+@st.cache_data(ttl=86400)
+def load_mf_trend() -> pd.DataFrame:
+    """Total value and scheme count per stock, for every stored month.
+
+    One row per (month, stock) — a few thousand rows — which pandas then
+    pivots. Doing the pivot in SQL would hardcode the month list.
+    """
+    return pd.read_sql(
+        text("""SELECT h.portfolio_date::text AS month, h.isin,
+                       i.instrument, i.sector,
+                       SUM(h.value_lakh) AS value_lakh,
+                       COUNT(DISTINCT h.scheme_id) AS schemes
+                FROM mf_holdings h
+                LEFT JOIN mf_instruments i ON i.isin = h.isin
+                GROUP BY h.portfolio_date, h.isin, i.instrument, i.sector
+                ORDER BY h.portfolio_date"""),
+        get_db(),
+    )
 
 
 @st.cache_data(ttl=86400)
@@ -664,6 +691,8 @@ SIGNED_COLUMNS = {
     "chg %", "chg_pct", "1W %", "1M %", "3M %", "6M %", "1Y %",
     "return %", "return_pct", "off high %", "off_high_pct", "P&L", "P&L %",
     "avg chg %", "gap %", "day chg %",
+    "holding chg %", "change (cr)", "change_cr", "change_pct",
+    "total change (cr)", "price chg %", "price 1M %", "scheme chg",
 }
 # Styling every cell is slow; past this many rows show the plain table.
 MAX_STYLED_ROWS = 400
@@ -1277,10 +1306,14 @@ with tab_mf:
                 value=True, key="mf_only_nse")
             view = flows[flows["symbol"].notna()] if only_nse else flows
 
+            # "chg_pct" and "ret_1M" are the share price, not the holding.
+            # Labelled explicitly: a column reading "1M %" beside fund flows
+            # invites exactly the wrong reading.
             DISPLAY = {"stock": "stock", "sector": "sector",
                        "value_cr": "held (cr)", "change_cr": "change (cr)",
+                       "change_pct": "holding chg %",
                        "schemes_cur": "schemes", "schemes_change": "scheme chg",
-                       "chg_pct": "chg %", "ret_1M": "1M %"}
+                       "chg_pct": "price chg %", "ret_1M": "price 1M %"}
 
             def mf_table(df, cols=None):
                 cols = [c for c in (cols or list(DISPLAY)) if c in df.columns]
@@ -1329,7 +1362,8 @@ with tab_mf:
                            "large fund adding.")
                 conv = view[view["schemes_change"] != 0].sort_values(
                     "schemes_change", ascending=False)
-                conv_cols = ["stock", "sector", "schemes_cur", "schemes_change", "change_cr"]
+                conv_cols = ["stock", "sector", "schemes_cur", "schemes_change",
+                             "change_cr", "change_pct"]
                 cc1, cc2 = st.columns(2)
                 with cc1:
                     st.caption("More schemes holding")
@@ -1360,6 +1394,89 @@ with tab_mf:
                        hide_index=True, use_container_width=True, height=420)
             download_button(mf_table(view.sort_values("value_cr", ascending=False)),
                             f"mf_holdings_{cur_month}.csv", "dl_mf_all")
+
+            st.markdown("### Month-on-month trend")
+            st.caption(
+                "One month's change is noise. A stock funds added to in every "
+                "month of the window is a position being built deliberately — "
+                "that is the signal worth acting on."
+            )
+            trend = load_mf_trend()
+            if trend.empty or trend["month"].nunique() < 2:
+                st.info(
+                    "Only one month stored, so there is no trend yet. Run "
+                    "FETCH-MF-HOLDINGS.bat and ask for 6 months — it takes a "
+                    "couple of minutes from your own machine."
+                )
+            else:
+                wide = (trend.pivot_table(index="isin", columns="month",
+                                          values="value_lakh", aggfunc="sum")
+                        .fillna(0) / 100).round(2)          # lakh -> crore
+                month_cols = list(wide.columns)             # oldest to newest
+                deltas = wide.diff(axis=1).iloc[:, 1:]
+
+                meta = (trend.sort_values("month")
+                        .groupby("isin")
+                        .agg(instrument=("instrument", "last"),
+                             sector=("sector", "last"),
+                             schemes=("schemes", "last")))
+
+                t = wide.join(meta)
+                first, last = wide[month_cols[0]], wide[month_cols[-1]]
+                t["total change"] = (last - first).round(2)
+                t["total change %"] = pd.Series(
+                    [round((b / a - 1) * 100, 2) if a and a > 0 else None
+                     for a, b in zip(first, last)], index=wide.index)
+                t["months rising"] = (deltas > 0).sum(axis=1)
+                t["months falling"] = (deltas < 0).sum(axis=1)
+                t["of"] = len(month_cols) - 1
+                t = t.reset_index()
+
+                iso_t = load_isin_symbol_map()
+                t = t.merge(iso_t[["isin", "symbol"]], on="isin", how="left")
+                t["stock"] = t["symbol"].fillna(
+                    t["instrument"].str.title().str.slice(0, 28))
+                if only_nse:
+                    t = t[t["symbol"].notna()]
+
+                n_steps = len(month_cols) - 1
+                direction = st.radio(
+                    "Show", ["Accumulating", "Reducing", "Everything"],
+                    horizontal=True, key="mf_trend_dir")
+                min_streak = st.slider(
+                    f"Rising (or falling) in at least this many of {n_steps} months",
+                    1, max(n_steps, 1), min(2, n_steps), key="mf_trend_streak")
+
+                if direction == "Accumulating":
+                    sel = t[t["months rising"] >= min_streak].sort_values(
+                        "total change", ascending=False)
+                elif direction == "Reducing":
+                    sel = t[t["months falling"] >= min_streak].sort_values(
+                        "total change")
+                else:
+                    sel = t.sort_values("total change", ascending=False)
+
+                st.caption(f"{len(sel):,} stocks")
+                cols = (["stock", "sector"] + month_cols +
+                        ["total change", "total change %", "months rising",
+                         "months falling", "of", "schemes"])
+                show_table(sel[cols].rename(
+                    columns={"total change": "total change (cr)"}),
+                    hide_index=True, use_container_width=True, height=460)
+                download_button(sel[cols], f"mf_trend_{cur_month}.csv", "dl_mf_trend")
+                st.caption("Month columns are the total held by all funds, in "
+                           "rupee crore, at each month-end.")
+
+                st.markdown("### Chart one stock's fund holding")
+                chart_opts = sel["stock"].tolist() or t["stock"].tolist()
+                if chart_opts:
+                    chart_pick = st.selectbox("Stock", chart_opts, key="mf_trend_pick")
+                    row = t[t["stock"] == chart_pick]
+                    if not row.empty:
+                        series = row.iloc[0][month_cols].astype(float)
+                        st.line_chart(series, height=260)
+                        st.caption(f"Total held by all mutual funds in "
+                                   f"{chart_pick}, rupee crore, by month-end.")
 
             st.markdown("### Which funds hold a stock")
             pick_opts = view.sort_values("value_cr", ascending=False)["stock"].tolist()
