@@ -410,7 +410,10 @@ def load_window_stats(as_of: str, days: int) -> pd.DataFrame:
 
 
 # ---- Mutual fund holdings (Advisorkhoj, refreshed monthly) --------------
-@st.cache_data(ttl=86400)
+# Short TTL on purpose, unlike the other fund queries. This one decides
+# whether the tab shows anything at all, so caching an empty answer for a day
+# hides a fetch that has just succeeded — which is exactly what happened.
+@st.cache_data(ttl=300)
 def load_mf_months() -> list[str]:
     """Portfolio month-ends we hold, oldest first."""
     try:
