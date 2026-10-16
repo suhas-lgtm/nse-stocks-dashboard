@@ -45,6 +45,12 @@ jobs:
       # Fund houses publish portfolios monthly, so this runs on the same
       # cadence. Skipped when ADVISORKHOJ_KEY isn't set, so a fork or a repo
       # without the key still gets a green run.
+      #
+      # NOTE: Advisorkhoj throttles datacentre IPs. The same fetch takes ~0.2s
+      # per request from a home connection and over an hour from a GitHub
+      # runner, so FETCH-MF-HOLDINGS.bat is the practical way to run this. The
+      # step stays here for when the API is willing, and the timeout stops it
+      # sitting for hours when it is not.
       - name: Refresh mutual fund holdings from Advisorkhoj
         if: env.ADVISORKHOJ_KEY != ''
         env:
@@ -53,6 +59,7 @@ jobs:
         # and the fetch is resumable — months already stored are skipped — so
         # history fills in over successive monthly runs instead of one long
         # burst that gets throttled.
+        timeout-minutes: 25
         run: python scripts/fetch_mf_holdings.py --months 2
 
       - name: Refresh shares outstanding from Yahoo Finance
