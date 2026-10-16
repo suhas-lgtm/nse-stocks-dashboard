@@ -184,7 +184,9 @@ def parse_date(ddmmyyyy: str) -> str | None:
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--months", type=int, default=6,
-                    help="how many complete months back to fetch (default 6)")
+                    help="how many months WITH DATA to collect (default 6)")
+    ap.add_argument("--max-lookback", type=int, default=14,
+                    help="how far back to look for them (default 14 months)")
     ap.add_argument("--categories", nargs="*", default=None,
                     help="specific categories instead of all equity-ish ones")
     ap.add_argument("--limit-schemes", type=int, default=None,
@@ -203,10 +205,16 @@ def main() -> int:
     schemes = list_schemes(key, args.categories)
     if args.limit_schemes:
         schemes = schemes[:args.limit_schemes]
-    months = recent_months(args.months)
-    print(f"{len(schemes):,} schemes x {len(months)} months "
-          f"({months[-1][1]} {months[-1][0]} to {months[0][1]} {months[0][0]}) "
-          f"= {len(schemes) * len(months):,} requests\n")
+    # Candidates, not targets: portfolios publish in arrears, so the most
+    # recent complete month usually has nothing yet. Mid-October asked every
+    # scheme for September, got status 400 from all of them, and stored
+    # nothing while reporting success. Walk back until --months months have
+    # actually produced data.
+    months = recent_months(args.max_lookback)
+    print(f"{len(schemes):,} schemes. Collecting {args.months} month(s) "
+          f"with published data, looking back as far as "
+          f"{months[-1][1]} {months[-1][0]}.")
+    print()
 
     # --- scheme ids -------------------------------------------------------
     bulk_upsert(engine, "mf_schemes", ["scheme", "category"],
@@ -229,10 +237,13 @@ def main() -> int:
     months_seen: list[str] = []
 
     for (year, month_name), pdate in zip(months, month_dates):
+        if len(months_seen) >= args.months:
+            break
         todo = [s for s, _c in schemes
                 if args.refetch or (scheme_ids.get(s), pdate) not in stored]
         if not todo:
-            print(f"{month_name} {year}: already complete, skipped")
+            print(f"{month_name} {year}: already stored, counts towards the target")
+            months_seen.append(pdate)
             continue
 
         print(f"{month_name} {year} ({pdate}): {len(todo):,} schemes to fetch")
@@ -275,8 +286,10 @@ def main() -> int:
                     time.sleep(PAUSE_SECONDS)
 
         if not holdings:
-            print(f"  no holdings published for {month_name} {year} "
-                  f"({failed:,} request failures)")
+            # Normal for a recent month: nothing published yet. Not an error,
+            # and it does not count towards the target.
+            print(f"  nothing published for {month_name} {year} "
+                  f"({failed:,} request failures) - looking further back")
             grand_failed += failed
             continue
 

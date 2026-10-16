@@ -53,7 +53,7 @@ jobs:
         # and the fetch is resumable — months already stored are skipped — so
         # history fills in over successive monthly runs instead of one long
         # burst that gets throttled.
-        run: python scripts/fetch_mf_holdings.py --months 1
+        run: python scripts/fetch_mf_holdings.py --months 2
 
       - name: Refresh shares outstanding from Yahoo Finance
         env:
