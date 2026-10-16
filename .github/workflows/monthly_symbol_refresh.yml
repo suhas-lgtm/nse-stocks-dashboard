@@ -7,6 +7,11 @@ on:
     # workflow that talks to NSE; the nightly price fetch uses Yahoo Finance
     # exclusively.
     - cron: "0 20 1 * *"
+    # Also weekly. Fund portfolios publish partway through the following
+    # month, so waiting for the 1st can leave a month missing for weeks. A
+    # run with nothing new now costs about six requests, because each month
+    # is probed with a few large funds before fetching all ~1,160.
+    - cron: "0 20 * * 0"
   workflow_dispatch: {}
 
 jobs:

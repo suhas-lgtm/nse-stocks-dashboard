@@ -61,6 +61,40 @@ PROGRESS_EVERY = 250
 
 MONTH_NAMES = [m.lower() for m in calendar.month_name[1:]]
 
+# Large funds that publish a portfolio every month without fail. Probing these
+# answers "does this month exist yet?" in six requests rather than 1,163 — the
+# September run spent five minutes discovering nothing that way.
+CANARY_SCHEMES = [
+    "HDFC Flexi Cap Fund",
+    "ICICI Prudential Bluechip Fund",
+    "SBI Bluechip Fund",
+    "Axis Flexi Cap Fund",
+    "Nippon India Large Cap Fund",
+    "Kotak Flexicap Fund",
+]
+
+
+def month_is_published(key: str, year: int, month: str,
+                       candidates: list[str]) -> bool:
+    """True if any canary has a portfolio for that month.
+
+    Also distinguishes the two ways a month comes back empty: not published
+    yet, versus the API throttling us into empty responses. Both look
+    identical per-request, but if none of six large funds has data the month
+    almost certainly is not out.
+    """
+    probes = [c for c in CANARY_SCHEMES if c in candidates][:4]
+    if not probes:
+        probes = candidates[:4]
+    for scheme in probes:
+        try:
+            if fetch_portfolio(key, scheme, year, month):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.3)
+    return False
+
 
 def api_key() -> str:
     key = os.environ.get("ADVISORKHOJ_KEY")
@@ -246,6 +280,11 @@ def main() -> int:
             months_seen.append(pdate)
             continue
 
+        # Six requests to find out whether the month exists at all.
+        if not month_is_published(key, year, month_name, [s for s, _c in schemes]):
+            print(f"{month_name} {year}: not published yet - looking further back")
+            continue
+
         print(f"{month_name} {year} ({pdate}): {len(todo):,} schemes to fetch")
         holdings: list[dict] = []
         instruments: dict[str, dict] = {}
@@ -284,6 +323,13 @@ def main() -> int:
                           f"{len(holdings):,} holdings", flush=True)
                 if done % PAUSE_EVERY == 0:
                     time.sleep(PAUSE_SECONDS)
+
+        reported = done - empty - failed
+        if reported and empty > reported * 2:
+            print(f"  WARNING: {empty:,} of {done:,} schemes returned nothing "
+                  f"after {reported:,} had returned data. That pattern is the "
+                  f"API throttling us, not funds failing to publish. Re-run "
+                  f"later to fill the gaps — stored scheme-months are skipped.")
 
         if not holdings:
             # Normal for a recent month: nothing published yet. Not an error,
